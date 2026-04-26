@@ -1,0 +1,36 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    - unconvert
+    - bodyclose
+    - errorlint
+    - exhaustive
+
+formatters:
+  enable:
+    - goimports
+
+formatters-settings:
+  goimports:
+    local-prefixes:
+      - github.com/eduardo-sl/go-blueprint
+
+issues:
+  exclude-rules:
+    - path: internal/platform/database/postgres/.*\.sql\.go
+      linters:
+        - all
+    - path: _test\.go
+      linters:
+        - errcheck
+    # S1016: explicit struct literals are clearer than type conversions between request/command types
+    - linters:
+        - staticcheck
+      text: "S1016"

@@ -1,0 +1,32 @@
+# binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# test output
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# environment
+.env
+.env.local
+
+# data
+data/
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# project instructions (not source code)
+CLAUDE.md
