@@ -10,6 +10,7 @@ import (
 
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
 	"github.com/eduardo-sl/go-blueprint/internal/eventlog"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -200,7 +201,7 @@ func TestService_Register(t *testing.T) {
 				tt.setup(repo)
 			}
 
-			svc := customer.NewService(repo, &noopStore{}, discardLogger())
+			svc := customer.NewService(repo, &noopStore{}, cache.NoopCache{}, discardLogger())
 			id, err := svc.Register(context.Background(), tt.cmd)
 
 			if tt.wantErr != nil {
@@ -227,7 +228,7 @@ func TestService_Remove(t *testing.T) {
 		c, _ := customer.New("Alice", "alice@example.com", yesterday)
 		_ = repo.Save(context.Background(), c)
 
-		svc := customer.NewService(repo, &noopStore{}, discardLogger())
+		svc := customer.NewService(repo, &noopStore{}, cache.NoopCache{}, discardLogger())
 		err := svc.Remove(context.Background(), c.ID)
 		require.NoError(t, err)
 
@@ -238,7 +239,7 @@ func TestService_Remove(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		t.Parallel()
 
-		svc := customer.NewService(newMockRepo(), &noopStore{}, discardLogger())
+		svc := customer.NewService(newMockRepo(), &noopStore{}, cache.NoopCache{}, discardLogger())
 		err := svc.Remove(context.Background(), uuid.New())
 		assert.True(t, errors.Is(err, customer.ErrNotFound))
 	})
