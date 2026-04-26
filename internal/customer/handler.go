@@ -1,6 +1,7 @@
 package customer
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -12,12 +13,19 @@ import (
 
 var _validate = validator.New()
 
-type Handler struct {
-	svc   *Service
-	query *QueryService
+// querier is the read-side interface consumed by Handler.
+// Both QueryService and CachedQueryService satisfy it.
+type querier interface {
+	GetByID(ctx context.Context, id uuid.UUID) (Customer, error)
+	List(ctx context.Context) ([]Customer, error)
 }
 
-func NewHandler(svc *Service, query *QueryService) *Handler {
+type Handler struct {
+	svc   *Service
+	query querier
+}
+
+func NewHandler(svc *Service, query querier) *Handler {
 	return &Handler{svc: svc, query: query}
 }
 

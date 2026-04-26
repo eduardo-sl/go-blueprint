@@ -18,6 +18,7 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/auth"
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
 	"github.com/eduardo-sl/go-blueprint/internal/eventlog"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/config"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database/postgres"
@@ -61,16 +62,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	var customerCache cache.Cache = cache.NoopCache{}
+	if cfg.RedisAddr != "" {
+		rc, err := cache.NewRedisCache(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, logger)
+		if err != nil {
+			logger.Warn("redis unavailable, cache disabled", slog.Any("error", err))
+		} else {
+			customerCache = rc
+		}
+	}
+
 	customerRepo := postgres.NewCustomerRepository(pool)
-	customerSvc := customer.NewService(customerRepo, eventLog, logger)
-	customerQuery := customer.NewQueryService(customerRepo)
+	customerSvc := customer.NewService(customerRepo, eventLog, customerCache, logger)
+	customerQuery := customer.NewCachedQueryService(
+		customer.NewQueryService(customerRepo),
+		customerCache,
+		cfg.CacheTTL,
+		logger,
+	)
 	customerHandler := customer.NewHandler(customerSvc, customerQuery)
 
 	userRepo := postgres.NewUserRepository(pool)
 	authSvc := auth.NewService(userRepo, cfg.JWTSecret, cfg.JWTExpiry, logger)
 	authHandler := auth.NewHandler(authSvc)
 
-	if err := server.Start(cfg, customerHandler, authHandler, logger); err != nil {
+	if err := server.Start(cfg, customerHandler, authHandler, customerCache, logger); err != nil {
 		logger.Error("server error", slog.Any("error", err))
 		os.Exit(1)
 	}
