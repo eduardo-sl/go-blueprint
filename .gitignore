@@ -1,5 +1,6 @@
 # binaries
 bin/
+api
 *.exe
 *.dll
 *.so
