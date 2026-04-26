@@ -31,10 +31,17 @@ const _shutdownTimeout = 10 * time.Second
 // @securityDefinitions.apikey BearerAuth
 // @in header
 // @name Authorization
+// CachePinger is satisfied by cache.RedisCache and cache.NoopCache.
+// Defined here so server does not import the cache package directly.
+type CachePinger interface {
+	Ping(ctx context.Context) error
+}
+
 func Start(
 	cfg *config.Config,
 	customerHandler *customer.Handler,
 	authHandler *auth.Handler,
+	appCache CachePinger,
 	logger *slog.Logger,
 ) error {
 	e := echo.New()
@@ -50,7 +57,7 @@ func Start(
 	protected := api.Group("", auth.JWTMiddleware(cfg.JWTSecret))
 	customerHandler.RegisterRoutes(protected)
 
-	e.GET("/health", healthCheck(cfg))
+	e.GET("/health", healthCheck(cfg, appCache))
 	e.GET("/swagger/*", echoswagger.WrapHandler)
 
 	srv := &http.Server{
@@ -92,13 +99,18 @@ func Start(
 
 var _startTime = time.Now()
 
-func healthCheck(cfg *config.Config) echo.HandlerFunc {
+func healthCheck(cfg *config.Config, appCache CachePinger) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		cacheStatus := "ok"
+		if err := appCache.Ping(c.Request().Context()); err != nil {
+			cacheStatus = "degraded"
+		}
 		return c.JSON(http.StatusOK, map[string]any{
 			"status":  "ok",
 			"version": "1.0.0",
 			"uptime":  time.Since(_startTime).String(),
 			"env":     cfg.Env,
+			"cache":   cacheStatus,
 		})
 	}
 }
