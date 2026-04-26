@@ -17,6 +17,10 @@ type Config struct {
 	JWTSecret    string        `mapstructure:"jwt_secret"`
 	JWTExpiry    time.Duration `mapstructure:"jwt_expiry"`
 	LogLevel     string        `mapstructure:"log_level"`
+	RedisAddr     string        `mapstructure:"redis_addr"`
+	RedisPassword string        `mapstructure:"redis_password"`
+	RedisDB       int           `mapstructure:"redis_db"`
+	CacheTTL      time.Duration `mapstructure:"cache_ttl"`
 }
 
 func Load() (*Config, error) {
@@ -36,6 +40,10 @@ func Load() (*Config, error) {
 	v.SetDefault("event_log_path", "./data/events.db")
 	v.SetDefault("jwt_expiry", "24h")
 	v.SetDefault("log_level", "info")
+	v.SetDefault("redis_addr", "")
+	v.SetDefault("redis_password", "")
+	v.SetDefault("redis_db", 0)
+	v.SetDefault("cache_ttl", "5m")
 
 	_ = v.ReadInConfig()
 
@@ -44,6 +52,18 @@ func Load() (*Config, error) {
 	}
 	if err := v.BindEnv("jwt_secret", "JWT_SECRET"); err != nil {
 		return nil, fmt.Errorf("config: bind JWT_SECRET: %w", err)
+	}
+	if err := v.BindEnv("redis_addr", "REDIS_ADDR"); err != nil {
+		return nil, fmt.Errorf("config: bind REDIS_ADDR: %w", err)
+	}
+	if err := v.BindEnv("redis_password", "REDIS_PASSWORD"); err != nil {
+		return nil, fmt.Errorf("config: bind REDIS_PASSWORD: %w", err)
+	}
+	if err := v.BindEnv("redis_db", "REDIS_DB"); err != nil {
+		return nil, fmt.Errorf("config: bind REDIS_DB: %w", err)
+	}
+	if err := v.BindEnv("cache_ttl", "CACHE_TTL"); err != nil {
+		return nil, fmt.Errorf("config: bind CACHE_TTL: %w", err)
 	}
 
 	var cfg Config
