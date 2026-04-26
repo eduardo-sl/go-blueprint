@@ -12,6 +12,7 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -65,6 +66,9 @@ type countingRepo struct {
 
 func (r *countingRepo) Save(ctx context.Context, c customer.Customer) error {
 	return r.inner.Save(ctx, c)
+}
+func (r *countingRepo) SaveTx(ctx context.Context, tx pgx.Tx, c customer.Customer) error {
+	return r.inner.SaveTx(ctx, tx, c)
 }
 func (r *countingRepo) Update(ctx context.Context, c customer.Customer) error {
 	return r.inner.Update(ctx, c)
