@@ -9,17 +9,19 @@ import (
 	"time"
 
 	"github.com/eduardo-sl/go-blueprint/internal/eventlog"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/google/uuid"
 )
 
 type Service struct {
 	repo     Repository
 	eventLog eventlog.Store
+	cache    cache.Cache
 	logger   *slog.Logger
 }
 
-func NewService(repo Repository, el eventlog.Store, logger *slog.Logger) *Service {
-	return &Service{repo: repo, eventLog: el, logger: logger}
+func NewService(repo Repository, el eventlog.Store, c cache.Cache, logger *slog.Logger) *Service {
+	return &Service{repo: repo, eventLog: el, cache: c, logger: logger}
 }
 
 type RegisterCmd struct {
@@ -85,6 +87,7 @@ func (s *Service) Update(ctx context.Context, cmd UpdateCmd) error {
 		return fmt.Errorf("customer.Service.Update: save: %w", err)
 	}
 
+	s.invalidate(ctx, c.ID)
 	s.appendEvent(ctx, "CustomerUpdated", c.ID, map[string]any{
 		"name":  c.Name,
 		"email": c.Email,
@@ -102,9 +105,22 @@ func (s *Service) Remove(ctx context.Context, id uuid.UUID) error {
 		return fmt.Errorf("customer.Service.Remove: delete: %w", err)
 	}
 
+	s.invalidate(ctx, id)
 	s.appendEvent(ctx, "CustomerRemoved", id, map[string]any{"id": id.String()})
 
 	return nil
+}
+
+// invalidate deletes the single-record key and the list key from cache.
+// Failures are logged but never propagated — stale cache beats a failed write.
+func (s *Service) invalidate(ctx context.Context, id uuid.UUID) {
+	keys := []string{cacheKeyPrefix + id.String(), cacheKeyList}
+	for _, key := range keys {
+		if err := s.cache.Delete(ctx, key); err != nil {
+			s.logger.WarnContext(ctx, "cache invalidation failed",
+				slog.String("key", key), slog.Any("error", err))
+		}
+	}
 }
 
 func (s *Service) appendEvent(ctx context.Context, eventType string, aggregateID uuid.UUID, payload any) {
