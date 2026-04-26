@@ -14,11 +14,28 @@ import (
 )
 
 type CustomerRepository struct {
-	q *Queries
+	q    *Queries
+	pool *pgxpool.Pool
 }
 
 func NewCustomerRepository(pool *pgxpool.Pool) *CustomerRepository {
-	return &CustomerRepository{q: New(pool)}
+	return &CustomerRepository{q: New(pool), pool: pool}
+}
+
+func (r *CustomerRepository) SaveTx(ctx context.Context, tx pgx.Tx, c customer.Customer) error {
+	q := r.q.WithTx(tx)
+	_, err := q.CreateCustomer(ctx, CreateCustomerParams{
+		ID:        c.ID,
+		Name:      c.Name,
+		Email:     c.Email,
+		BirthDate: toPgDate(c.BirthDate),
+		CreatedAt: toPgTimestamptz(c.CreatedAt),
+		UpdatedAt: toPgTimestamptz(c.UpdatedAt),
+	})
+	if err != nil {
+		return fmt.Errorf("postgres.CustomerRepository.SaveTx: %w", err)
+	}
+	return nil
 }
 
 func (r *CustomerRepository) Save(ctx context.Context, c customer.Customer) error {

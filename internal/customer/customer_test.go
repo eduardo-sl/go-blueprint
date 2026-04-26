@@ -12,6 +12,7 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/eventlog"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -271,6 +272,10 @@ func (m *mockRepo) Save(_ context.Context, c customer.Customer) error {
 	m.customers[c.ID] = c
 	m.byEmail[c.Email] = c
 	return nil
+}
+
+func (m *mockRepo) SaveTx(_ context.Context, _ pgx.Tx, c customer.Customer) error {
+	return m.Save(context.Background(), c)
 }
 
 func (m *mockRepo) Update(_ context.Context, c customer.Customer) error {
