@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database"
 	pgrepo "github.com/eduardo-sl/go-blueprint/internal/platform/database/postgres"
 	"github.com/google/uuid"
@@ -57,7 +58,7 @@ func TestCustomerRepository_Integration(t *testing.T) {
 
 	repo := pgrepo.NewCustomerRepository(pool)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := customer.NewService(repo, &noopStore{}, logger)
+	svc := customer.NewService(repo, &noopStore{}, cache.NoopCache{}, logger)
 	query := customer.NewQueryService(repo)
 
 	yesterday := time.Now().AddDate(0, 0, -1)
