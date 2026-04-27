@@ -21,6 +21,10 @@ type Config struct {
 	RedisPassword string        `mapstructure:"redis_password"`
 	RedisDB       int           `mapstructure:"redis_db"`
 	CacheTTL      time.Duration `mapstructure:"cache_ttl"`
+	WorkerCount    int `mapstructure:"worker_count"`
+	WorkerQueue    int `mapstructure:"worker_queue"`
+	OutboxInterval int `mapstructure:"outbox_interval"` // seconds
+	OutboxBatch    int `mapstructure:"outbox_batch"`
 }
 
 func Load() (*Config, error) {
@@ -44,6 +48,10 @@ func Load() (*Config, error) {
 	v.SetDefault("redis_password", "")
 	v.SetDefault("redis_db", 0)
 	v.SetDefault("cache_ttl", "5m")
+	v.SetDefault("worker_count", 4)
+	v.SetDefault("worker_queue", 100)
+	v.SetDefault("outbox_interval", 5)
+	v.SetDefault("outbox_batch", 50)
 
 	_ = v.ReadInConfig()
 
