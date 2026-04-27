@@ -1,4 +1,4 @@
-.PHONY: run build test test-integration lint generate migrate migrate-down swagger docker-up docker-down
+.PHONY: run build test test-integration lint generate migrate migrate-down swagger docker-up docker-down jaeger metrics
 
 run:
 	go run ./cmd/api
@@ -33,3 +33,9 @@ docker-up:
 
 docker-down:
 	docker compose down
+
+jaeger:
+	open http://localhost:16686
+
+metrics:
+	curl -s http://localhost:9091/metrics | grep go_blueprint
