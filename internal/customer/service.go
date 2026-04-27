@@ -9,19 +9,43 @@ import (
 	"time"
 
 	"github.com/eduardo-sl/go-blueprint/internal/eventlog"
+	"github.com/eduardo-sl/go-blueprint/internal/outbox"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
-type Service struct {
-	repo     Repository
-	eventLog eventlog.Store
-	cache    cache.Cache
-	logger   *slog.Logger
+// Beginner is satisfied by *pgxpool.Pool and any test stub.
+// Defined here so the service does not import pgxpool directly.
+type Beginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
-func NewService(repo Repository, el eventlog.Store, c cache.Cache, logger *slog.Logger) *Service {
-	return &Service{repo: repo, eventLog: el, cache: c, logger: logger}
+type Service struct {
+	repo        Repository
+	db          Beginner
+	outboxStore outbox.OutboxStore
+	eventLog    eventlog.Store
+	cache       cache.Cache
+	logger      *slog.Logger
+}
+
+func NewService(
+	repo Repository,
+	db Beginner,
+	outboxStore outbox.OutboxStore,
+	el eventlog.Store,
+	c cache.Cache,
+	logger *slog.Logger,
+) *Service {
+	return &Service{
+		repo:        repo,
+		db:          db,
+		outboxStore: outboxStore,
+		eventLog:    el,
+		cache:       c,
+		logger:      logger,
+	}
 }
 
 type RegisterCmd struct {
@@ -44,8 +68,28 @@ func (s *Service) Register(ctx context.Context, cmd RegisterCmd) (uuid.UUID, err
 		return uuid.Nil, fmt.Errorf("customer.Service.Register: %w", err)
 	}
 
-	if err := s.repo.Save(ctx, c); err != nil {
+	// Both the customer write and the outbox message must commit atomically.
+	// If the process crashes after the customer is persisted but before the
+	// outbox message is written, the event would be lost forever.
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("customer.Service.Register: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful Commit
+
+	if err := s.repo.SaveTx(ctx, tx, c); err != nil {
 		return uuid.Nil, fmt.Errorf("customer.Service.Register: save: %w", err)
+	}
+
+	if err := s.appendOutbox(ctx, tx, "CustomerRegistered", c.ID, map[string]any{
+		"id":    c.ID.String(),
+		"email": c.Email,
+	}); err != nil {
+		return uuid.Nil, fmt.Errorf("customer.Service.Register: outbox: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return uuid.Nil, fmt.Errorf("customer.Service.Register: commit: %w", err)
 	}
 
 	s.appendEvent(ctx, "CustomerRegistered", c.ID, map[string]any{
@@ -83,8 +127,25 @@ func (s *Service) Update(ctx context.Context, cmd UpdateCmd) error {
 		return fmt.Errorf("customer.Service.Update: %w", err)
 	}
 
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("customer.Service.Update: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	if err := s.repo.Update(ctx, c); err != nil {
 		return fmt.Errorf("customer.Service.Update: save: %w", err)
+	}
+
+	if err := s.appendOutbox(ctx, tx, "CustomerUpdated", c.ID, map[string]any{
+		"id":    c.ID.String(),
+		"email": c.Email,
+	}); err != nil {
+		return fmt.Errorf("customer.Service.Update: outbox: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("customer.Service.Update: commit: %w", err)
 	}
 
 	s.invalidate(ctx, c.ID)
@@ -101,14 +162,46 @@ func (s *Service) Remove(ctx context.Context, id uuid.UUID) error {
 		return fmt.Errorf("customer.Service.Remove: find: %w", err)
 	}
 
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("customer.Service.Remove: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	if err := s.repo.Delete(ctx, id); err != nil {
 		return fmt.Errorf("customer.Service.Remove: delete: %w", err)
+	}
+
+	if err := s.appendOutbox(ctx, tx, "CustomerRemoved", id, map[string]any{
+		"id": id.String(),
+	}); err != nil {
+		return fmt.Errorf("customer.Service.Remove: outbox: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("customer.Service.Remove: commit: %w", err)
 	}
 
 	s.invalidate(ctx, id)
 	s.appendEvent(ctx, "CustomerRemoved", id, map[string]any{"id": id.String()})
 
 	return nil
+}
+
+// appendOutbox serialises payload and writes an OutboxMessage inside tx.
+func (s *Service) appendOutbox(ctx context.Context, tx pgx.Tx, eventType string, aggregateID uuid.UUID, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+	msg := outbox.OutboxMessage{
+		ID:          uuid.New(),
+		AggregateID: aggregateID,
+		EventType:   eventType,
+		Payload:     data,
+		CreatedAt:   time.Now().UTC(),
+	}
+	return s.outboxStore.SaveTx(ctx, tx, msg)
 }
 
 // invalidate deletes the single-record key and the list key from cache.

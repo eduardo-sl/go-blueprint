@@ -10,9 +10,11 @@ import (
 
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
 	"github.com/eduardo-sl/go-blueprint/internal/eventlog"
+	"github.com/eduardo-sl/go-blueprint/internal/outbox"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -202,7 +204,7 @@ func TestService_Register(t *testing.T) {
 				tt.setup(repo)
 			}
 
-			svc := customer.NewService(repo, &noopStore{}, cache.NoopCache{}, discardLogger())
+			svc := newTestService(repo)
 			id, err := svc.Register(context.Background(), tt.cmd)
 
 			if tt.wantErr != nil {
@@ -229,7 +231,7 @@ func TestService_Remove(t *testing.T) {
 		c, _ := customer.New("Alice", "alice@example.com", yesterday)
 		_ = repo.Save(context.Background(), c)
 
-		svc := customer.NewService(repo, &noopStore{}, cache.NoopCache{}, discardLogger())
+		svc := newTestService(repo)
 		err := svc.Remove(context.Background(), c.ID)
 		require.NoError(t, err)
 
@@ -240,7 +242,7 @@ func TestService_Remove(t *testing.T) {
 	t.Run("not found", func(t *testing.T) {
 		t.Parallel()
 
-		svc := customer.NewService(newMockRepo(), &noopStore{}, cache.NoopCache{}, discardLogger())
+		svc := newTestService(newMockRepo())
 		err := svc.Remove(context.Background(), uuid.New())
 		assert.True(t, errors.Is(err, customer.ErrNotFound))
 	})
@@ -252,9 +254,38 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-type noopStore struct{}
+type noopEventStore struct{}
 
-func (n *noopStore) Append(_ context.Context, _ eventlog.Event) error { return nil }
+func (n *noopEventStore) Append(_ context.Context, _ eventlog.Event) error { return nil }
+
+type noopOutboxStore struct{}
+
+func (n *noopOutboxStore) SaveTx(_ context.Context, _ pgx.Tx, _ outbox.OutboxMessage) error {
+	return nil
+}
+func (n *noopOutboxStore) FetchUnprocessed(_ context.Context, _ int) ([]outbox.OutboxMessage, error) {
+	return nil, nil
+}
+func (n *noopOutboxStore) MarkProcessed(_ context.Context, _ uuid.UUID) error { return nil }
+func (n *noopOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error { return nil }
+
+// stubTx is a no-op pgx.Tx for unit tests that do not touch a real database.
+// Methods not implemented here panic — if a test triggers them, add the stub.
+type stubTx struct{ pgx.Tx }
+
+func (t *stubTx) Commit(_ context.Context) error   { return nil }
+func (t *stubTx) Rollback(_ context.Context) error { return nil }
+func (t *stubTx) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+
+type stubBeginner struct{}
+
+func (b *stubBeginner) Begin(_ context.Context) (pgx.Tx, error) { return &stubTx{}, nil }
+
+func newTestService(repo customer.Repository) *customer.Service {
+	return customer.NewService(repo, &stubBeginner{}, &noopOutboxStore{}, &noopEventStore{}, cache.NoopCache{}, discardLogger())
+}
 
 type mockRepo struct {
 	customers map[uuid.UUID]customer.Customer
