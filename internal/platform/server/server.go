@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -19,29 +16,34 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/config"
 	appmiddleware "github.com/eduardo-sl/go-blueprint/internal/platform/middleware"
+	"github.com/eduardo-sl/go-blueprint/internal/worker"
 )
 
 const _shutdownTimeout = 10 * time.Second
 
-// @title           Go Blueprint API
-// @version         1.0
-// @description     Idiomatic Go REST API demonstrating DDD, CQRS, and Clean Architecture
-// @host            localhost:8080
-// @BasePath        /api/v1
-// @securityDefinitions.apikey BearerAuth
-// @in header
-// @name Authorization
 // CachePinger is satisfied by cache.RedisCache and cache.NoopCache.
 // Defined here so server does not import the cache package directly.
 type CachePinger interface {
 	Ping(ctx context.Context) error
 }
 
+// Start configures Echo, registers routes, starts the HTTP server, and blocks
+// until ctx is cancelled. It then drains in-flight requests with a 10-second
+// timeout before returning.
+//
+// Graceful shutdown sequence (orchestrated by the caller, not by this function):
+//  1. OS signal received → caller cancels root ctx
+//  2. Start returns after Echo drains active requests (10s timeout)
+//  3. Caller calls worker.Pool.Stop() — drains queued jobs, waits for in-flight
+//  4. Caller defers pool.Close() — Postgres connections released
+//  5. Process exits 0
 func Start(
+	ctx context.Context,
 	cfg *config.Config,
 	customerHandler *customer.Handler,
 	authHandler *auth.Handler,
 	appCache CachePinger,
+	workerPool *worker.Pool,
 	logger *slog.Logger,
 ) error {
 	e := echo.New()
@@ -76,20 +78,18 @@ func Start(
 		}
 	}()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
 	select {
 	case err := <-errCh:
 		return err
-	case sig := <-quit:
-		logger.Info("shutdown signal received", slog.String("signal", sig.String()))
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, draining requests")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), _shutdownTimeout)
+	// Step 2: stop accepting new connections and drain active requests.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), _shutdownTimeout)
 	defer cancel()
 
-	if err := e.Shutdown(ctx); err != nil {
+	if err := e.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("server: shutdown: %w", err)
 	}
 
