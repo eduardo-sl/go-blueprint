@@ -16,6 +16,7 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/config"
 	appmiddleware "github.com/eduardo-sl/go-blueprint/internal/platform/middleware"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
 	"github.com/eduardo-sl/go-blueprint/internal/worker"
 )
 
@@ -51,6 +52,7 @@ func Start(
 	e.HidePort = true
 
 	appmiddleware.Register(e, logger)
+	e.Use(telemetry.EchoMiddleware(cfg.OTelServiceName))
 
 	api := e.Group("/api/v1")
 
