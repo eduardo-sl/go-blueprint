@@ -25,6 +25,10 @@ type Config struct {
 	WorkerQueue    int `mapstructure:"worker_queue"`
 	OutboxInterval int `mapstructure:"outbox_interval"` // seconds
 	OutboxBatch    int `mapstructure:"outbox_batch"`
+	OTelEnabled     bool   `mapstructure:"otel_enabled"`
+	OTelServiceName string `mapstructure:"otel_service_name"`
+	OTelEndpoint    string `mapstructure:"otel_endpoint"`
+	MetricsAddr     string `mapstructure:"metrics_addr"`
 }
 
 func Load() (*Config, error) {
@@ -52,6 +56,10 @@ func Load() (*Config, error) {
 	v.SetDefault("worker_queue", 100)
 	v.SetDefault("outbox_interval", 5)
 	v.SetDefault("outbox_batch", 50)
+	v.SetDefault("otel_enabled", false)
+	v.SetDefault("otel_service_name", "go-blueprint")
+	v.SetDefault("otel_endpoint", "http://localhost:4318")
+	v.SetDefault("metrics_addr", ":9091")
 
 	_ = v.ReadInConfig()
 
@@ -72,6 +80,18 @@ func Load() (*Config, error) {
 	}
 	if err := v.BindEnv("cache_ttl", "CACHE_TTL"); err != nil {
 		return nil, fmt.Errorf("config: bind CACHE_TTL: %w", err)
+	}
+	if err := v.BindEnv("otel_enabled", "OTEL_ENABLED"); err != nil {
+		return nil, fmt.Errorf("config: bind OTEL_ENABLED: %w", err)
+	}
+	if err := v.BindEnv("otel_service_name", "OTEL_SERVICE_NAME"); err != nil {
+		return nil, fmt.Errorf("config: bind OTEL_SERVICE_NAME: %w", err)
+	}
+	if err := v.BindEnv("otel_endpoint", "OTEL_EXPORTER_OTLP_ENDPOINT"); err != nil {
+		return nil, fmt.Errorf("config: bind OTEL_EXPORTER_OTLP_ENDPOINT: %w", err)
+	}
+	if err := v.BindEnv("metrics_addr", "METRICS_ADDR"); err != nil {
+		return nil, fmt.Errorf("config: bind METRICS_ADDR: %w", err)
 	}
 
 	var cfg Config
