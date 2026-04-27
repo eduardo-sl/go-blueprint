@@ -12,11 +12,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/eduardo-sl/go-blueprint/internal/auth"
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
@@ -27,6 +31,7 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database/postgres"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/server"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
 	"github.com/eduardo-sl/go-blueprint/internal/worker"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -39,12 +44,42 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := newLogger(cfg.Env, cfg.LogLevel)
+	logger := newLogger(cfg)
 	slog.SetDefault(logger)
 
 	// Root context — cancelled on OS signal to trigger graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Init OTel SDK when enabled. Provider.Shutdown() is called explicitly below,
+	// before the Postgres pool closes, to flush in-flight spans that include DB child spans.
+	var telProv *telemetry.Provider
+	if cfg.OTelEnabled {
+		telProv, err = telemetry.Setup(ctx, cfg)
+		if err != nil {
+			logger.Error("failed to init telemetry", slog.Any("error", err))
+			os.Exit(1)
+		}
+		// Re-initialize metric instruments bound to the real SDK meter provider.
+		if err := telemetry.InitMetrics(); err != nil {
+			logger.Error("failed to init metrics", slog.Any("error", err))
+			os.Exit(1)
+		}
+	}
+
+	// Metrics server — separate port, not publicly exposed with the API.
+	var metricsSrv *http.Server
+	if cfg.OTelEnabled {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		metricsSrv = &http.Server{Addr: cfg.MetricsAddr, Handler: mux}
+		go func() {
+			logger.Info("metrics server starting", slog.String("addr", cfg.MetricsAddr))
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("metrics server error", slog.Any("error", err))
+			}
+		}()
+	}
 
 	pool, err := database.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -121,16 +156,37 @@ func main() {
 	// The outbox poller already exited because ctx was cancelled before this point.
 	workerPool.Stop()
 	logger.Info("worker pool drained")
-	// Step 4: Postgres pool closed via defer pool.Close() above.
-	// Step 5: process exits 0.
+
+	// Step 4: flush OTel spans and metrics before closing the database pool.
+	// Pending spans include DB child spans — the tracer provider must still be
+	// running when the pgx pool closes so those spans are exported correctly.
+	if telProv != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := telProv.Shutdown(shutCtx); err != nil {
+			logger.Error("telemetry shutdown error", slog.Any("error", err))
+		}
+		logger.Info("telemetry flushed")
+	}
+	if metricsSrv != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shutCtx)
+	}
+
+	// Step 5: Postgres pool closed via defer pool.Close() above.
+	// Step 6: process exits 0.
 }
 
-func newLogger(env, level string) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: parseLevel(level)}
-	if env == "production" || env == "prod" {
-		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
+func newLogger(cfg *config.Config) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: parseLevel(cfg.LogLevel)}
+	var base slog.Handler
+	if cfg.Env == "production" || cfg.Env == "prod" {
+		base = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		base = slog.NewTextHandler(os.Stdout, opts)
 	}
-	return slog.New(slog.NewTextHandler(os.Stdout, opts))
+	return slog.New(telemetry.NewOTelHandler(base))
 }
 
 func parseLevel(level string) slog.Level {
