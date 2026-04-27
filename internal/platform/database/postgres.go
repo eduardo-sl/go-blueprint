@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
 )
 
 const (
@@ -27,6 +29,7 @@ func NewPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	cfg.MaxConnLifetime = _maxConnLife
 	cfg.MaxConnIdleTime = _maxConnIdle
 	cfg.HealthCheckPeriod = _healthPeriod
+	cfg.ConnConfig.Tracer = telemetry.NewPgxTracer()
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
