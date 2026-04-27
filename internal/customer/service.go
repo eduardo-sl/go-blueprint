@@ -11,9 +11,15 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/eventlog"
 	"github.com/eduardo-sl/go-blueprint/internal/outbox"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
+
+var svcTracer = otel.Tracer("customer.service")
 
 // Beginner is satisfied by *pgxpool.Pool and any test stub.
 // Defined here so the service does not import pgxpool directly.
@@ -55,17 +61,29 @@ type RegisterCmd struct {
 }
 
 func (s *Service) Register(ctx context.Context, cmd RegisterCmd) (uuid.UUID, error) {
+	ctx, span := svcTracer.Start(ctx, "customer.Service.Register")
+	defer span.End()
+
+	span.SetAttributes(attribute.String("customer.email", cmd.Email))
+
 	_, err := s.repo.FindByEmail(ctx, cmd.Email)
 	if err == nil {
+		span.SetStatus(codes.Error, ErrEmailExists.Error())
 		return uuid.Nil, ErrEmailExists
 	}
 	if !errors.Is(err, ErrNotFound) {
-		return uuid.Nil, fmt.Errorf("customer.Service.Register: check email: %w", err)
+		err = fmt.Errorf("customer.Service.Register: check email: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return uuid.Nil, err
 	}
 
 	c, err := New(cmd.Name, cmd.Email, cmd.BirthDate)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("customer.Service.Register: %w", err)
+		err = fmt.Errorf("customer.Service.Register: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return uuid.Nil, err
 	}
 
 	// Both the customer write and the outbox message must commit atomically.
@@ -73,24 +91,39 @@ func (s *Service) Register(ctx context.Context, cmd RegisterCmd) (uuid.UUID, err
 	// outbox message is written, the event would be lost forever.
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("customer.Service.Register: begin tx: %w", err)
+		err = fmt.Errorf("customer.Service.Register: begin tx: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return uuid.Nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful Commit
 
 	if err := s.repo.SaveTx(ctx, tx, c); err != nil {
-		return uuid.Nil, fmt.Errorf("customer.Service.Register: save: %w", err)
+		err = fmt.Errorf("customer.Service.Register: save: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return uuid.Nil, err
 	}
 
 	if err := s.appendOutbox(ctx, tx, "CustomerRegistered", c.ID, map[string]any{
 		"id":    c.ID.String(),
 		"email": c.Email,
 	}); err != nil {
-		return uuid.Nil, fmt.Errorf("customer.Service.Register: outbox: %w", err)
+		err = fmt.Errorf("customer.Service.Register: outbox: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return uuid.Nil, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return uuid.Nil, fmt.Errorf("customer.Service.Register: commit: %w", err)
+		err = fmt.Errorf("customer.Service.Register: commit: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return uuid.Nil, err
 	}
+
+	span.SetAttributes(attribute.String("customer.id", c.ID.String()))
+	telemetry.CustomerRegistrations.Add(ctx, 1)
 
 	s.appendEvent(ctx, "CustomerRegistered", c.ID, map[string]any{
 		"name":  c.Name,
@@ -108,44 +141,71 @@ type UpdateCmd struct {
 }
 
 func (s *Service) Update(ctx context.Context, cmd UpdateCmd) error {
+	ctx, span := svcTracer.Start(ctx, "customer.Service.Update")
+	defer span.End()
+
+	span.SetAttributes(attribute.String("customer.id", cmd.ID.String()))
+
 	c, err := s.repo.FindByID(ctx, cmd.ID)
 	if err != nil {
-		return fmt.Errorf("customer.Service.Update: find: %w", err)
+		err = fmt.Errorf("customer.Service.Update: find: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	if c.Email != cmd.Email {
 		_, err := s.repo.FindByEmail(ctx, cmd.Email)
 		if err == nil {
+			span.SetStatus(codes.Error, ErrEmailExists.Error())
 			return ErrEmailExists
 		}
 		if !errors.Is(err, ErrNotFound) {
-			return fmt.Errorf("customer.Service.Update: check email: %w", err)
+			err = fmt.Errorf("customer.Service.Update: check email: %w", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
 		}
 	}
 
 	if err := c.Update(cmd.Name, cmd.Email, cmd.BirthDate); err != nil {
-		return fmt.Errorf("customer.Service.Update: %w", err)
+		err = fmt.Errorf("customer.Service.Update: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("customer.Service.Update: begin tx: %w", err)
+		err = fmt.Errorf("customer.Service.Update: begin tx: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := s.repo.Update(ctx, c); err != nil {
-		return fmt.Errorf("customer.Service.Update: save: %w", err)
+		err = fmt.Errorf("customer.Service.Update: save: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	if err := s.appendOutbox(ctx, tx, "CustomerUpdated", c.ID, map[string]any{
 		"id":    c.ID.String(),
 		"email": c.Email,
 	}); err != nil {
-		return fmt.Errorf("customer.Service.Update: outbox: %w", err)
+		err = fmt.Errorf("customer.Service.Update: outbox: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("customer.Service.Update: commit: %w", err)
+		err = fmt.Errorf("customer.Service.Update: commit: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	s.invalidate(ctx, c.ID)
@@ -158,30 +218,51 @@ func (s *Service) Update(ctx context.Context, cmd UpdateCmd) error {
 }
 
 func (s *Service) Remove(ctx context.Context, id uuid.UUID) error {
+	ctx, span := svcTracer.Start(ctx, "customer.Service.Remove")
+	defer span.End()
+
+	span.SetAttributes(attribute.String("customer.id", id.String()))
+
 	if _, err := s.repo.FindByID(ctx, id); err != nil {
-		return fmt.Errorf("customer.Service.Remove: find: %w", err)
+		err = fmt.Errorf("customer.Service.Remove: find: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("customer.Service.Remove: begin tx: %w", err)
+		err = fmt.Errorf("customer.Service.Remove: begin tx: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := s.repo.Delete(ctx, id); err != nil {
-		return fmt.Errorf("customer.Service.Remove: delete: %w", err)
+		err = fmt.Errorf("customer.Service.Remove: delete: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	if err := s.appendOutbox(ctx, tx, "CustomerRemoved", id, map[string]any{
 		"id": id.String(),
 	}); err != nil {
-		return fmt.Errorf("customer.Service.Remove: outbox: %w", err)
+		err = fmt.Errorf("customer.Service.Remove: outbox: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("customer.Service.Remove: commit: %w", err)
+		err = fmt.Errorf("customer.Service.Remove: commit: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
+	telemetry.CustomerRemovals.Add(ctx, 1)
 	s.invalidate(ctx, id)
 	s.appendEvent(ctx, "CustomerRemoved", id, map[string]any{"id": id.String()})
 

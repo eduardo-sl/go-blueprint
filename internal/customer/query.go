@@ -10,7 +10,12 @@ import (
 
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
+
+var queryTracer = otel.Tracer("customer.query")
 
 type QueryService struct {
 	repo Repository
@@ -21,18 +26,34 @@ func NewQueryService(repo Repository) *QueryService {
 }
 
 func (q *QueryService) GetByID(ctx context.Context, id uuid.UUID) (Customer, error) {
+	ctx, span := queryTracer.Start(ctx, "customer.QueryService.GetByID")
+	defer span.End()
+
+	span.SetAttributes(attribute.String("customer.id", id.String()))
+
 	c, err := q.repo.FindByID(ctx, id)
 	if err != nil {
-		return Customer{}, fmt.Errorf("customer.QueryService.GetByID: %w", err)
+		err = fmt.Errorf("customer.QueryService.GetByID: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return Customer{}, err
 	}
 	return c, nil
 }
 
 func (q *QueryService) List(ctx context.Context) ([]Customer, error) {
+	ctx, span := queryTracer.Start(ctx, "customer.QueryService.List")
+	defer span.End()
+
 	cs, err := q.repo.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("customer.QueryService.List: %w", err)
+		err = fmt.Errorf("customer.QueryService.List: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
+
+	span.SetAttributes(attribute.Int("customer.count", len(cs)))
 	return cs, nil
 }
 
