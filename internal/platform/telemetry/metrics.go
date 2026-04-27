@@ -31,6 +31,12 @@ var (
 	OutboxPublishFailures   metric.Int64Counter
 )
 
+func init() {
+	// Pre-initialize all instruments to noop so callers never receive nil.
+	// main() calls InitMetrics() again after Setup() to bind real instruments.
+	_ = InitMetrics()
+}
+
 // InitMetrics registers all metric instruments with the global meter.
 // Call once after Setup() (or without it — noop meter is used when OTel is disabled).
 func InitMetrics() error {
