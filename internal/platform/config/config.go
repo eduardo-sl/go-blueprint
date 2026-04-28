@@ -58,7 +58,7 @@ func Load() (*Config, error) {
 	v.SetDefault("outbox_batch", 50)
 	v.SetDefault("otel_enabled", false)
 	v.SetDefault("otel_service_name", "go-blueprint")
-	v.SetDefault("otel_endpoint", "http://localhost:4318")
+	v.SetDefault("otel_endpoint", "localhost:4318")
 	v.SetDefault("metrics_addr", ":9091")
 
 	_ = v.ReadInConfig()
