@@ -10,6 +10,11 @@ import (
 
 const _contextKeyUserID = "user_id"
 
+// ClaimsKey is the context key under which JWT claims are stored by the gRPC auth interceptor.
+type claimsContextKey struct{}
+
+var ClaimsKey = claimsContextKey{}
+
 func JWTMiddleware(secret string) echo.MiddlewareFunc {
 	key := []byte(secret)
 	return func(next echo.HandlerFunc) echo.HandlerFunc {

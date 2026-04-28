@@ -257,6 +257,9 @@ func discardLogger() *slog.Logger {
 type noopEventStore struct{}
 
 func (n *noopEventStore) Append(_ context.Context, _ eventlog.Event) error { return nil }
+func (n *noopEventStore) FetchSince(_ context.Context, _ string, _ time.Time) ([]eventlog.Event, error) {
+	return nil, nil
+}
 
 type noopOutboxStore struct{}
 
