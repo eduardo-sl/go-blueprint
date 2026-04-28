@@ -17,6 +17,7 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/platform/config"
 	appmiddleware "github.com/eduardo-sl/go-blueprint/internal/platform/middleware"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
+	"github.com/eduardo-sl/go-blueprint/internal/product"
 	"github.com/eduardo-sl/go-blueprint/internal/worker"
 )
 
@@ -42,7 +43,9 @@ func Start(
 	ctx context.Context,
 	cfg *config.Config,
 	customerHandler *customer.Handler,
+	preferencesHandler *customer.PreferencesHandler,
 	authHandler *auth.Handler,
+	productHandler *product.Handler,
 	appCache CachePinger,
 	workerPool *worker.Pool,
 	logger *slog.Logger,
@@ -60,6 +63,8 @@ func Start(
 
 	protected := api.Group("", auth.JWTMiddleware(cfg.JWTSecret))
 	customerHandler.RegisterRoutes(protected)
+	preferencesHandler.RegisterPreferencesRoutes(protected)
+	productHandler.RegisterRoutes(protected)
 
 	e.GET("/health", healthCheck(cfg, appCache))
 	e.GET("/swagger/*", echoswagger.WrapHandler)

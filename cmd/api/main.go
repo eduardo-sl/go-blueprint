@@ -30,10 +30,12 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/config"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/database/mongodb"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database/postgres"
 	grpcserver "github.com/eduardo-sl/go-blueprint/internal/platform/grpc"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/server"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
+	"github.com/eduardo-sl/go-blueprint/internal/product"
 	"github.com/eduardo-sl/go-blueprint/internal/worker"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -148,6 +150,30 @@ func main() {
 	authSvc := auth.NewService(userRepo, cfg.JWTSecret, cfg.JWTExpiry, logger)
 	authHandler := auth.NewHandler(authSvc)
 
+	// MongoDB — Product Catalog and Customer Preferences.
+	mongoClient, err := mongodb.NewClient(ctx, cfg.MongoURI)
+	if err != nil {
+		logger.Error("failed to connect to mongodb", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer func() { _ = mongoClient.Disconnect(context.Background()) }()
+
+	mongoDB := mongoClient.Database(cfg.MongoDatabase)
+	if err := mongodb.EnsureIndexes(ctx, mongoDB); err != nil {
+		logger.Error("mongodb index creation failed", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	productRepo := mongodb.NewProductRepository(mongoDB)
+	productSvc := product.NewService(productRepo, logger)
+	productQuery := product.NewQueryService(productRepo)
+	productHandler := product.NewHandler(productSvc, productQuery)
+
+	preferencesRepo := mongodb.NewPreferencesRepository(mongoDB)
+	preferencesHandler := customer.NewPreferencesHandler(
+		customer.NewPreferencesService(preferencesRepo),
+	)
+
 	// gRPC server — started only when GRPC_ENABLED=true (default false).
 	var grpcSrv *grpc.Server
 	if cfg.GRPCEnabled {
@@ -169,7 +195,7 @@ func main() {
 
 	// Step 2: HTTP server drains active requests with a 10-second timeout.
 	// server.Start blocks until ctx is cancelled, then shuts down Echo.
-	if err := server.Start(ctx, cfg, customerHandler, authHandler, customerCache, workerPool, logger); err != nil {
+	if err := server.Start(ctx, cfg, customerHandler, preferencesHandler, authHandler, productHandler, customerCache, workerPool, logger); err != nil {
 		logger.Error("server error", slog.Any("error", err))
 		os.Exit(1)
 	}
