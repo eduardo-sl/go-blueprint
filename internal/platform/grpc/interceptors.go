@@ -79,8 +79,13 @@ func streamLoggingInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor 
 
 // authInterceptor validates the Bearer token from gRPC metadata and injects the
 // JWT claims into the context under auth.ClaimsKey.
+// Reflection service methods are exempt so Postman/grpcurl can discover services
+// without a token.
 func authInterceptor(authSvc *auth.Service) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if isPublicMethod(info.FullMethod) {
+			return handler(ctx, req)
+		}
 		token, err := extractToken(ctx)
 		if err != nil {
 			return nil, err
@@ -97,6 +102,9 @@ func authInterceptor(authSvc *auth.Service) grpc.UnaryServerInterceptor {
 // streamAuthInterceptor is the streaming equivalent of authInterceptor.
 func streamAuthInterceptor(authSvc *auth.Service) grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if isPublicMethod(info.FullMethod) {
+			return handler(srv, ss)
+		}
 		token, err := extractToken(ss.Context())
 		if err != nil {
 			return err
@@ -108,6 +116,13 @@ func streamAuthInterceptor(authSvc *auth.Service) grpc.StreamServerInterceptor {
 		ctx := context.WithValue(ss.Context(), auth.ClaimsKey, claims)
 		return handler(srv, &wrappedStream{ServerStream: ss, ctx: ctx})
 	}
+}
+
+// isPublicMethod returns true for gRPC reflection service calls, which must be
+// accessible without authentication so that Postman, grpcurl, and other tools
+// can discover the API schema.
+func isPublicMethod(fullMethod string) bool {
+	return strings.HasPrefix(fullMethod, "/grpc.reflection.")
 }
 
 func extractToken(ctx context.Context) (string, error) {
