@@ -33,6 +33,12 @@ type Config struct {
 	GRPCAddr    string `mapstructure:"grpc_addr"`
 	MongoURI      string `mapstructure:"mongo_uri"`
 	MongoDatabase string `mapstructure:"mongo_database"`
+	KafkaEnabled         bool   `mapstructure:"kafka_enabled"`
+	KafkaBrokers         string `mapstructure:"kafka_brokers"`
+	KafkaTopicCustomers  string `mapstructure:"kafka_topic_customers"`
+	KafkaDLQTopic        string `mapstructure:"kafka_dlq_topic"`
+	KafkaConsumerGroup   string `mapstructure:"kafka_consumer_group"`
+	KafkaProducerRetries int    `mapstructure:"kafka_producer_retries"`
 }
 
 func Load() (*Config, error) {
@@ -68,6 +74,12 @@ func Load() (*Config, error) {
 	v.SetDefault("grpc_addr", ":9090")
 	v.SetDefault("mongo_uri", "mongodb://localhost:27017")
 	v.SetDefault("mongo_database", "go_blueprint")
+	v.SetDefault("kafka_enabled", false)
+	v.SetDefault("kafka_brokers", "localhost:9092")
+	v.SetDefault("kafka_topic_customers", "customers.events")
+	v.SetDefault("kafka_dlq_topic", "customers.events.dlq")
+	v.SetDefault("kafka_consumer_group", "go-blueprint")
+	v.SetDefault("kafka_producer_retries", 3)
 
 	_ = v.ReadInConfig()
 
@@ -112,6 +124,24 @@ func Load() (*Config, error) {
 	}
 	if err := v.BindEnv("mongo_database", "MONGO_DATABASE"); err != nil {
 		return nil, fmt.Errorf("config: bind MONGO_DATABASE: %w", err)
+	}
+	if err := v.BindEnv("kafka_enabled", "KAFKA_ENABLED"); err != nil {
+		return nil, fmt.Errorf("config: bind KAFKA_ENABLED: %w", err)
+	}
+	if err := v.BindEnv("kafka_brokers", "KAFKA_BROKERS"); err != nil {
+		return nil, fmt.Errorf("config: bind KAFKA_BROKERS: %w", err)
+	}
+	if err := v.BindEnv("kafka_topic_customers", "KAFKA_TOPIC_CUSTOMERS"); err != nil {
+		return nil, fmt.Errorf("config: bind KAFKA_TOPIC_CUSTOMERS: %w", err)
+	}
+	if err := v.BindEnv("kafka_dlq_topic", "KAFKA_DLQ_TOPIC"); err != nil {
+		return nil, fmt.Errorf("config: bind KAFKA_DLQ_TOPIC: %w", err)
+	}
+	if err := v.BindEnv("kafka_consumer_group", "KAFKA_CONSUMER_GROUP"); err != nil {
+		return nil, fmt.Errorf("config: bind KAFKA_CONSUMER_GROUP: %w", err)
+	}
+	if err := v.BindEnv("kafka_producer_retries", "KAFKA_PRODUCER_RETRIES"); err != nil {
+		return nil, fmt.Errorf("config: bind KAFKA_PRODUCER_RETRIES: %w", err)
 	}
 
 	var cfg Config
