@@ -31,6 +31,8 @@ type Config struct {
 	MetricsAddr     string `mapstructure:"metrics_addr"`
 	GRPCEnabled bool   `mapstructure:"grpc_enabled"`
 	GRPCAddr    string `mapstructure:"grpc_addr"`
+	MongoURI      string `mapstructure:"mongo_uri"`
+	MongoDatabase string `mapstructure:"mongo_database"`
 }
 
 func Load() (*Config, error) {
@@ -64,6 +66,8 @@ func Load() (*Config, error) {
 	v.SetDefault("metrics_addr", ":9091")
 	v.SetDefault("grpc_enabled", false)
 	v.SetDefault("grpc_addr", ":9090")
+	v.SetDefault("mongo_uri", "mongodb://localhost:27017")
+	v.SetDefault("mongo_database", "go_blueprint")
 
 	_ = v.ReadInConfig()
 
@@ -102,6 +106,12 @@ func Load() (*Config, error) {
 	}
 	if err := v.BindEnv("grpc_addr", "GRPC_ADDR"); err != nil {
 		return nil, fmt.Errorf("config: bind GRPC_ADDR: %w", err)
+	}
+	if err := v.BindEnv("mongo_uri", "MONGO_URI"); err != nil {
+		return nil, fmt.Errorf("config: bind MONGO_URI: %w", err)
+	}
+	if err := v.BindEnv("mongo_database", "MONGO_DATABASE"); err != nil {
+		return nil, fmt.Errorf("config: bind MONGO_DATABASE: %w", err)
 	}
 
 	var cfg Config

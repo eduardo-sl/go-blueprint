@@ -25,6 +25,18 @@ services:
       timeout: 3s
       retries: 5
 
+  mongodb:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: go_blueprint
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/go_blueprint --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   jaeger:
     image: jaegertracing/all-in-one:1.57
     ports:
