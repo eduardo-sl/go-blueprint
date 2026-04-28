@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package customer.v1;
+
+option go_package = "github.com/eduardo-sl/go-blueprint/gen/customer/v1;customerv1";
+
+import "google/protobuf/timestamp.proto";
+
+service CustomerService {
+  rpc RegisterCustomer(RegisterCustomerRequest) returns (RegisterCustomerResponse);
+  rpc GetCustomer(GetCustomerRequest) returns (GetCustomerResponse);
+  rpc ListCustomers(ListCustomersRequest) returns (ListCustomersResponse);
+  rpc UpdateCustomer(UpdateCustomerRequest) returns (UpdateCustomerResponse);
+  rpc RemoveCustomer(RemoveCustomerRequest) returns (RemoveCustomerResponse);
+
+  // Server-side streaming: delivers new customer events as they are appended to the event log.
+  rpc WatchCustomerEvents(WatchCustomerEventsRequest) returns (stream CustomerEvent);
+}
+
+message Customer {
+  string id         = 1;
+  string name       = 2;
+  string email      = 3;
+  string birth_date = 4; // ISO 8601: YYYY-MM-DD
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message RegisterCustomerRequest {
+  string name       = 1;
+  string email      = 2;
+  string birth_date = 3;
+}
+message RegisterCustomerResponse { string id = 1; }
+
+message GetCustomerRequest  { string id = 1; }
+message GetCustomerResponse { Customer customer = 1; }
+
+message ListCustomersRequest  {}
+message ListCustomersResponse { repeated Customer customers = 1; }
+
+message UpdateCustomerRequest {
+  string id         = 1;
+  string name       = 2;
+  string email      = 3;
+  string birth_date = 4;
+}
+message UpdateCustomerResponse {}
+
+message RemoveCustomerRequest  { string id = 1; }
+message RemoveCustomerResponse {}
+
+// empty aggregate_id = watch all events
+message WatchCustomerEventsRequest { string aggregate_id = 1; }
+message CustomerEvent {
+  string event_type    = 1;
+  string aggregate_id  = 2;
+  bytes  payload       = 3;
+  google.protobuf.Timestamp occurred_at = 4;
+}
