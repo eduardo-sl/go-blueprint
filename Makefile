@@ -1,4 +1,4 @@
-.PHONY: run build test test-integration lint generate migrate migrate-down swagger docker-up docker-down jaeger metrics proto grpc-test
+.PHONY: run build test test-integration lint generate migrate migrate-down swagger docker-up docker-down jaeger metrics proto grpc-test kafka-topics kafka-consume
 
 run:
 	go run ./cmd/api
@@ -52,3 +52,16 @@ grpc-test:
 	grpcurl -plaintext \
 	  -H "Authorization: Bearer $$TOKEN" \
 	  localhost:9090 customer.v1.CustomerService/ListCustomers
+
+kafka-topics:
+	docker exec -it go-blueprint-kafka-1 \
+	  kafka-topics --create --if-not-exists --bootstrap-server localhost:9092 \
+	  --topic customers.events --partitions 3 --replication-factor 1
+	docker exec -it go-blueprint-kafka-1 \
+	  kafka-topics --create --if-not-exists --bootstrap-server localhost:9092 \
+	  --topic customers.events.dlq --partitions 1 --replication-factor 1
+
+kafka-consume:
+	docker exec -it go-blueprint-kafka-1 \
+	  kafka-console-consumer --bootstrap-server localhost:9092 \
+	  --topic customers.events --from-beginning --property print.headers=true
