@@ -18,4 +18,7 @@ type Event struct {
 
 type Store interface {
 	Append(ctx context.Context, e Event) error
+	// FetchSince returns events that occurred after since, optionally filtered by
+	// aggregateID (empty string = all aggregates).
+	FetchSince(ctx context.Context, aggregateID string, since time.Time) ([]Event, error)
 }

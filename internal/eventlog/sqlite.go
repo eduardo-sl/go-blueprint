@@ -59,3 +59,61 @@ func (s *sqliteStore) Append(ctx context.Context, e Event) error {
 	}
 	return nil
 }
+
+func (s *sqliteStore) FetchSince(ctx context.Context, aggregateID string, since time.Time) ([]Event, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+
+	sinceStr := since.UTC().Format(time.RFC3339Nano)
+
+	if aggregateID == "" {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT id, aggregate_id, event_type, payload, occurred_at
+			 FROM event_log WHERE occurred_at > ? ORDER BY occurred_at ASC`,
+			sinceStr,
+		)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT id, aggregate_id, event_type, payload, occurred_at
+			 FROM event_log WHERE aggregate_id = ? AND occurred_at > ? ORDER BY occurred_at ASC`,
+			aggregateID, sinceStr,
+		)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("eventlog: fetch since: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var events []Event
+	for rows.Next() {
+		var (
+			e          Event
+			idStr      string
+			aggIDStr   string
+			occurredAt string
+			payload    string
+		)
+		if err := rows.Scan(&idStr, &aggIDStr, &e.EventType, &payload, &occurredAt); err != nil {
+			return nil, fmt.Errorf("eventlog: scan row: %w", err)
+		}
+		if err := e.ID.UnmarshalText([]byte(idStr)); err != nil {
+			return nil, fmt.Errorf("eventlog: parse event id: %w", err)
+		}
+		if err := e.AggregateID.UnmarshalText([]byte(aggIDStr)); err != nil {
+			return nil, fmt.Errorf("eventlog: parse aggregate id: %w", err)
+		}
+		e.Payload = []byte(payload)
+		t, err := time.Parse(time.RFC3339Nano, occurredAt)
+		if err != nil {
+			return nil, fmt.Errorf("eventlog: parse occurred_at: %w", err)
+		}
+		e.OccurredAt = t.UTC()
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("eventlog: rows error: %w", err)
+	}
+	return events, nil
+}
