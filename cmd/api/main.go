@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,11 +31,13 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/platform/config"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database/postgres"
+	grpcserver "github.com/eduardo-sl/go-blueprint/internal/platform/grpc"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/server"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
 	"github.com/eduardo-sl/go-blueprint/internal/worker"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -145,11 +148,37 @@ func main() {
 	authSvc := auth.NewService(userRepo, cfg.JWTSecret, cfg.JWTExpiry, logger)
 	authHandler := auth.NewHandler(authSvc)
 
+	// gRPC server — started only when GRPC_ENABLED=true (default false).
+	var grpcSrv *grpc.Server
+	if cfg.GRPCEnabled {
+		grpcHandler := customer.NewGRPCHandler(customerSvc, customerQuery, eventLog)
+		grpcSrv = grpcserver.NewServer(grpcHandler, authSvc, logger)
+
+		lis, err := net.Listen("tcp", cfg.GRPCAddr)
+		if err != nil {
+			logger.Error("grpc: listener failed", slog.String("addr", cfg.GRPCAddr), slog.Any("error", err))
+			os.Exit(1)
+		}
+		go func() {
+			logger.Info("grpc server starting", slog.String("addr", cfg.GRPCAddr))
+			if err := grpcSrv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+				logger.Error("grpc server error", slog.Any("error", err))
+			}
+		}()
+	}
+
 	// Step 2: HTTP server drains active requests with a 10-second timeout.
 	// server.Start blocks until ctx is cancelled, then shuts down Echo.
 	if err := server.Start(ctx, cfg, customerHandler, authHandler, customerCache, workerPool, logger); err != nil {
 		logger.Error("server error", slog.Any("error", err))
 		os.Exit(1)
+	}
+
+	// Graceful shutdown for gRPC — called after HTTP drains so in-flight unary
+	// calls complete before the server stops accepting new ones.
+	if grpcSrv != nil {
+		grpcSrv.GracefulStop()
+		logger.Info("grpc server stopped")
 	}
 
 	// Step 3: worker pool drains queued jobs and waits for in-flight deliveries.

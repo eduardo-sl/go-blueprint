@@ -29,6 +29,8 @@ type Config struct {
 	OTelServiceName string `mapstructure:"otel_service_name"`
 	OTelEndpoint    string `mapstructure:"otel_endpoint"`
 	MetricsAddr     string `mapstructure:"metrics_addr"`
+	GRPCEnabled bool   `mapstructure:"grpc_enabled"`
+	GRPCAddr    string `mapstructure:"grpc_addr"`
 }
 
 func Load() (*Config, error) {
@@ -60,6 +62,8 @@ func Load() (*Config, error) {
 	v.SetDefault("otel_service_name", "go-blueprint")
 	v.SetDefault("otel_endpoint", "localhost:4318")
 	v.SetDefault("metrics_addr", ":9091")
+	v.SetDefault("grpc_enabled", false)
+	v.SetDefault("grpc_addr", ":9090")
 
 	_ = v.ReadInConfig()
 
@@ -92,6 +96,12 @@ func Load() (*Config, error) {
 	}
 	if err := v.BindEnv("metrics_addr", "METRICS_ADDR"); err != nil {
 		return nil, fmt.Errorf("config: bind METRICS_ADDR: %w", err)
+	}
+	if err := v.BindEnv("grpc_enabled", "GRPC_ENABLED"); err != nil {
+		return nil, fmt.Errorf("config: bind GRPC_ENABLED: %w", err)
+	}
+	if err := v.BindEnv("grpc_addr", "GRPC_ADDR"); err != nil {
+		return nil, fmt.Errorf("config: bind GRPC_ADDR: %w", err)
 	}
 
 	var cfg Config
