@@ -11,10 +11,14 @@ import (
 	"time"
 
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
+	"github.com/eduardo-sl/go-blueprint/internal/eventlog"
+	"github.com/eduardo-sl/go-blueprint/internal/outbox"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database"
 	pgrepo "github.com/eduardo-sl/go-blueprint/internal/platform/database/postgres"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,6 +26,22 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
+
+// noopOutbox satisfies outbox.OutboxStore without side effects.
+type noopOutbox struct{}
+
+func (noopOutbox) SaveTx(_ context.Context, _ pgx.Tx, _ outbox.OutboxMessage) error         { return nil }
+func (noopOutbox) FetchUnprocessed(_ context.Context, _ int) ([]outbox.OutboxMessage, error) { return nil, nil }
+func (noopOutbox) MarkProcessed(_ context.Context, _ uuid.UUID) error                        { return nil }
+func (noopOutbox) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error                 { return nil }
+
+// noopEventLog satisfies eventlog.Store without side effects.
+type noopEventLog struct{}
+
+func (noopEventLog) Append(_ context.Context, _ eventlog.Event) error { return nil }
+func (noopEventLog) FetchSince(_ context.Context, _ string, _ time.Time) ([]eventlog.Event, error) {
+	return nil, nil
+}
 
 func TestCustomerRepository_Integration(t *testing.T) {
 	if testing.Short() {
@@ -51,14 +71,14 @@ func TestCustomerRepository_Integration(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 
-	sqlDB, err := goose.OpenDBWithDriver("pgx/v5", dsn)
+	sqlDB, err := goose.OpenDBWithDriver("pgx", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	require.NoError(t, goose.Up(sqlDB, "../../migrations"))
 
 	repo := pgrepo.NewCustomerRepository(pool)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := customer.NewService(repo, &noopStore{}, cache.NoopCache{}, logger)
+	svc := customer.NewService(repo, pool, noopOutbox{}, noopEventLog{}, cache.NoopCache{}, logger)
 	query := customer.NewQueryService(repo)
 
 	yesterday := time.Now().AddDate(0, 0, -1)
