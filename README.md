@@ -5,6 +5,7 @@
 ![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
 ![Echo](https://img.shields.io/badge/Echo-v4-blue)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)
+![MongoDB](https://img.shields.io/badge/MongoDB-7.0-47A248?logo=mongodb&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -23,6 +24,7 @@ Go Blueprint is a production-grade reference architecture for Go REST APIs. The 
 - CQRS with explicit service types instead of a mediator bus
 - Clean Architecture with Go's package model
 - An append-only event log for domain audit
+- **Polyglot Persistence**: Customer on PostgreSQL, Product Catalog on MongoDB — two bounded contexts, two data stores, no coupling
 
 ---
 
@@ -82,6 +84,7 @@ Domain has zero infrastructure imports. The `postgres` package satisfies the `cu
 | **SQLite for event log** | Lightweight append-only audit log; no Postgres dependency for events |
 | **Manual wiring** | `cmd/api/main.go` wires all dependencies explicitly — no reflection, no surprises |
 | **Transport agnosticism** | gRPC and HTTP share the same `Service`/`QueryService` — no business logic duplication |
+| **Polyglot persistence** | Customer → Postgres; Product Catalog → MongoDB. Two bounded contexts, two data stores, zero coupling |
 
 ---
 
@@ -95,6 +98,7 @@ Domain has zero infrastructure imports. The `postgres` package satisfies the `cu
 | gRPC | `google.golang.org/grpc` | Parallel transport, proto-first contract |
 | SQL codegen | `github.com/sqlc-dev/sqlc` | Type-safe Go from `.sql` files |
 | DB driver | `github.com/jackc/pgx/v5` | PostgreSQL native, fast, no CGo |
+| MongoDB driver | `go.mongodb.org/mongo-driver/v2` | Product Catalog — flexible schema, text search |
 | SQLite (Event Log) | `modernc.org/sqlite` | Pure Go, no CGo |
 | Migrations | `github.com/pressly/goose/v3` | SQL-first, runs at startup |
 
@@ -132,14 +136,25 @@ go-blueprint/
 │       └── main.go              # Entry point — wires everything, starts Echo
 │
 ├── internal/
-│   ├── customer/                # Customer aggregate
+│   ├── customer/                # Customer aggregate (Postgres)
 │   │   ├── domain.go            # Entity, sentinel errors, New(), Update()
 │   │   ├── repository.go        # Repository interface (consumer-defined)
 │   │   ├── service.go           # Write side: Register, Update, Remove
 │   │   ├── query.go             # Read side: GetByID, List
 │   │   ├── handler.go           # Echo HTTP handlers + route registration
+│   │   ├── preferences.go       # CustomerPreferences entity + PreferencesRepository interface
+│   │   ├── preferences_service.go # Write/read: Upsert, GetByCustomerID
+│   │   ├── preferences_handler.go # Echo handlers for GET/PUT /customers/:id/preferences
 │   │   ├── customer_test.go     # Unit tests (table-driven, in-memory mock)
 │   │   └── integration_test.go  # Integration tests (build tag: integration)
+│   │
+│   ├── product/                 # Product Catalog aggregate (MongoDB)
+│   │   ├── domain.go            # Product, Variant, Category, sentinel errors, NewProduct()
+│   │   ├── repository.go        # Repository interface (consumer-defined)
+│   │   ├── service.go           # Write side: Create, Update, Archive
+│   │   ├── query.go             # Read side: GetByID, Search, ListByCategory
+│   │   ├── handler.go           # Echo HTTP handlers + route registration
+│   │   └── product_test.go      # Unit tests (table-driven, mock repo)
 │   │
 │   ├── auth/
 │   │   ├── domain.go            # User entity, sentinel errors
@@ -156,6 +171,10 @@ go-blueprint/
 │       ├── config/config.go     # Viper config, Load(), startup validation
 │       ├── database/
 │       │   ├── postgres.go      # pgxpool init with connection limits
+│       │   ├── mongodb/         # MongoDB client + repository adapters
+│       │   │   ├── client.go          # NewClient, EnsureIndexes (idempotent)
+│       │   │   ├── product_repo.go    # Satisfies product.Repository
+│       │   │   └── preferences_repo.go # Satisfies customer.PreferencesRepository
 │       │   └── postgres/        # sqlc-generated code + repository adapters
 │       │       ├── models.go          # Generated DB types
 │       │       ├── customers.sql.go   # Generated customer queries
@@ -208,12 +227,12 @@ cp .env.example .env
 
 Edit `.env` and set a strong `JWT_SECRET` (32+ characters). `DATABASE_URL` points to the local Postgres started in the next step.
 
-### 2. Start PostgreSQL
+### 2. Start PostgreSQL and MongoDB
 
 ```bash
 docker compose up -d
 
-# Confirm it is healthy before proceeding
+# Confirm all services are healthy before proceeding
 docker compose ps
 ```
 
@@ -406,6 +425,25 @@ curl -s -X POST http://localhost:8080/api/v1/customers \
 | `PUT` | `/api/v1/customers/:id` | `{name, email, birth_date}` | `204` |
 | `DELETE` | `/api/v1/customers/:id` | — | `204` |
 
+### Products (JWT required)
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `POST` | `/api/v1/products` | `{name, sku, category, attributes, variants, price_cents}` | `201 {id}` |
+| `GET` | `/api/v1/products/:id` | — | `200 {product}` |
+| `GET` | `/api/v1/products?category=&q=&limit=&offset=` | — | `200 [{product}]` |
+| `PUT` | `/api/v1/products/:id` | `{name, description, attributes, price_cents}` | `204` |
+| `DELETE` | `/api/v1/products/:id` | — | `204` (soft delete — sets `active: false`) |
+
+Product ID is a 24-character MongoDB ObjectID hex string (e.g. `507f1f77bcf86cd799439011`).
+
+### Customer Preferences (JWT required)
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `GET` | `/api/v1/customers/:id/preferences` | — | `200 {preferences}` |
+| `PUT` | `/api/v1/customers/:id/preferences` | `{favorite_categories, watchlist}` | `204` |
+
 ### System
 
 | Method | Path | Response |
@@ -496,6 +534,8 @@ Copy `.env.example` to `.env`:
 | `LOG_LEVEL` | `info` | No | `debug` / `info` / `warn` / `error` |
 | `GRPC_ENABLED` | `false` | No | Set `true` to start gRPC server alongside HTTP |
 | `GRPC_ADDR` | `:9090` | No | gRPC server listen address |
+| `MONGO_URI` | `mongodb://localhost:27017` | No | MongoDB connection string for the Product Catalog |
+| `MONGO_DATABASE` | `go_blueprint` | No | MongoDB database name |
 
 ---
 
@@ -522,6 +562,37 @@ grpcurl -plaintext \
 ```
 
 See [`docs/grpc.md`](docs/grpc.md) for the full reference.
+
+---
+
+## MongoDB — Product Catalog
+
+The Product Catalog is a second bounded context backed by MongoDB. Products have variable schemas per category (electronics, clothing, food, books) and embedded variant documents — a natural fit for MongoDB's flexible document model.
+
+```bash
+# Create a product
+curl -s -X POST http://localhost:8080/api/v1/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Wireless Headphones",
+    "sku": "WH-001",
+    "category": "electronics",
+    "attributes": {"voltage": "5V", "warranty_months": 24},
+    "variants": [{"sku_suffix": "-BLK", "attributes": {"color": "black"}, "stock_units": 50}],
+    "price_cents": 9999
+  }' | jq
+
+# Search by text
+curl -s "http://localhost:8080/api/v1/products?q=wireless" \
+  -H "Authorization: Bearer $TOKEN" | jq
+
+# Filter by category and attribute
+curl -s "http://localhost:8080/api/v1/products?category=clothing&attributes[material]=cotton" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+See [`docs/mongodb.md`](docs/mongodb.md) for the full reference.
 
 ---
 
