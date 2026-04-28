@@ -53,7 +53,7 @@ npx skills add eduardo-sl/go-agent-skills
 | Transactional Outbox (Postgres) | ✅ Implemented | `internal/outbox/`, `internal/customer/service.go` |
 | Health endpoint with cache status | ✅ Implemented | `internal/platform/server/server.go` |
 | Swagger/OpenAPI docs | ✅ Implemented | `docs/` (generated), annotations in handlers |
-| gRPC transport | 🔲 Spec ready, not implemented | `extensions/grpc/SPEC.md` |
+| gRPC transport | ✅ Implemented | `internal/customer/grpc.go`, `internal/platform/grpc/`, `proto/`, `gen/` |
 | Kafka producer/consumer | 🔲 Spec ready, not implemented | `extensions/messaging/SPEC.md` |
 | OpenTelemetry (traces + metrics) | 🔲 Spec ready, not implemented | `extensions/observability/SPEC.md` |
 | MongoDB / Product Catalog context | 🔲 Spec ready, not implemented | `extensions/mongodb/SPEC.md` |
@@ -106,10 +106,12 @@ internal/auth/service.go                           — Service: Register (bcrypt
                                                      HS256 with sub/email/exp/iat); TokenResponse type
 internal/auth/handler.go                           — Echo handlers /auth/register and /auth/login; mapAuthError(); RegisterRoutes()
 internal/auth/middleware.go                        — JWTMiddleware(secret) echo.MiddlewareFunc; sets "user_id" in echo.Context;
-                                                     extractBearerToken
+                                                     extractBearerToken; ClaimsKey (typed context key for gRPC interceptor)
 
-internal/eventlog/store.go                         — Event struct; Store interface: Append(ctx, Event) error
-internal/eventlog/sqlite.go                        — sqliteStore; NewSQLiteStore(path) runs inline DDL migration; Append inserts rows
+internal/eventlog/store.go                         — Event struct; Store interface: Append(ctx, Event) error;
+                                                     FetchSince(ctx, aggregateID string, since time.Time) ([]Event, error)
+internal/eventlog/sqlite.go                        — sqliteStore; NewSQLiteStore(path) runs inline DDL migration; Append inserts rows;
+                                                     FetchSince queries events after since, optionally filtered by aggregateID
 
 internal/platform/cache/cache.go                   — Cache interface (Get/Set/Delete/Ping); ErrCacheMiss sentinel;
                                                      NoopCache{} (Get→ErrCacheMiss, Set/Delete/Ping→nil)
@@ -134,6 +136,14 @@ internal/platform/middleware/middleware.go          — Register(e, logger): Req
 internal/platform/server/server.go                 — Start(ctx, cfg, customerHandler, authHandler, appCache, workerPool, logger);
                                                      CachePinger interface; healthCheck handler (reports cache status);
                                                      /swagger/* route; 10s shutdown timeout
+
+internal/customer/grpc.go                          — GRPCHandler implements customerv1.CustomerServiceServer; all 5 RPCs + streaming
+                                                     WatchCustomerEvents; mapDomainErrorToGRPC (lives here to avoid circular import);
+                                                     toProto converts Customer → proto message; reuses querier interface from handler.go
+internal/platform/grpc/server.go                   — NewServer: ChainUnaryInterceptor + ChainStreamInterceptor (recovery, logging, auth);
+                                                     reflection.Register for grpcurl discovery
+internal/platform/grpc/interceptors.go             — recoveryInterceptor, loggingInterceptor, authInterceptor (unary + streaming variants);
+                                                     extractToken helper; wrappedStream injects auth context into streaming calls
 
 internal/worker/pool.go                            — Pool; Job func(ctx context.Context) error; ErrPoolFull; New starts goroutines
                                                      immediately; Submit non-blocking; Stop closes channel + wg.Wait()
@@ -187,12 +197,16 @@ cmd/api/main.go                         [wiring only, no business logic]
   │     ├── imports: customer           [Handler]
   │     ├── imports: worker             [Pool passed for future health metrics]
   │     └── imports: platform/middleware
+  ├── platform/grpc                     [infra — gRPC server + interceptors]
+  │     ├── imports: customer           [GRPCHandler]
+  │     └── imports: auth               [Service.ValidateToken, ClaimsKey]
   ├── platform/cache                    [infra — Redis, NoopCache]
   ├── platform/middleware               [infra — Echo middleware]
   ├── customer/                         [DOMAIN — zero DB driver imports]
-  │     ├── imports: eventlog           [Store interface]
+  │     ├── imports: eventlog           [Store interface — Append + FetchSince]
   │     ├── imports: outbox             [OutboxStore interface + OutboxMessage]
-  │     └── imports: platform/cache    [Cache interface]
+  │     ├── imports: platform/cache    [Cache interface]
+  │     └── imports: gen/customer/v1   [generated proto types — gRPC only]
   ├── auth/                             [DOMAIN — zero DB driver imports]
   ├── eventlog/                         [infra — imports modernc.org/sqlite]
   ├── worker/                           [stdlib only — sync, context; no external deps]
@@ -282,6 +296,8 @@ cmd/api/main.go                         [wiring only, no business logic]
 | `WORKER_QUEUE` | `WorkerQueue` | `100` | worker | No (buffered channel size) |
 | `OUTBOX_INTERVAL` | `OutboxInterval` | `5` | outbox | No (seconds between polls) |
 | `OUTBOX_BATCH` | `OutboxBatch` | `50` | outbox | No (max messages per poll) |
+| `GRPC_ENABLED` | `GRPCEnabled` | `false` | grpc | No — `true` starts gRPC server alongside HTTP |
+| `GRPC_ADDR` | `GRPCAddr` | `":9090"` | grpc | No — gRPC listen address |
 
 Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) plus `AutomaticEnv()`. `.env` loaded by godotenv (silently ignored if absent). Explicit `BindEnv` for required vars ensures env overrides YAML.
 
@@ -323,10 +339,14 @@ Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) p
 18. postgres.NewUserRepository(pool)
 19. auth.NewService(userRepo, cfg.JWTSecret, cfg.JWTExpiry, logger)
 20. auth.NewHandler(authSvc)
-21. server.Start(ctx, cfg, customerHandler, authHandler, cache, workerPool, logger) — BLOCKS
-22. [ctx cancelled] server.Start returns after Echo drains (10s timeout)
-23. workerPool.Stop()                       — drains queued jobs; waits for in-flight
-24. [defer] pool.Close()                    — Postgres connections released; process exits 0
+21. [if cfg.GRPCEnabled] customer.NewGRPCHandler(customerSvc, customerQuery, eventLog)
+22. [if cfg.GRPCEnabled] grpcserver.NewServer(handler, authSvc, logger)
+23. [if cfg.GRPCEnabled] go grpcSrv.Serve(lis)  — gRPC server goroutine
+24. server.Start(ctx, cfg, customerHandler, authHandler, cache, workerPool, logger) — BLOCKS
+25. [ctx cancelled] server.Start returns after Echo drains (10s timeout)
+26. [if cfg.GRPCEnabled] grpcSrv.GracefulStop() — waits for in-flight gRPC calls
+27. workerPool.Stop()                       — drains queued jobs; waits for in-flight
+28. [defer] pool.Close()                    — Postgres connections released; process exits 0
 ```
 
 ---
@@ -406,12 +426,12 @@ Step 5: process exits 0
 
 ## 14. Extension Roadmap
 
-| Extension | Spec | Prerequisite | Key new packages | What it adds |
+| Extension | Spec | Status | Key packages | What it adds |
 |---|---|---|---|---|
-| gRPC | `extensions/grpc/SPEC.md` | none | `google.golang.org/grpc`, `google.golang.org/protobuf` | Parallel gRPC transport alongside Echo; same Service/QueryService reused; interceptors for auth/logging; shows transport agnosticism |
-| OpenTelemetry | `extensions/observability/SPEC.md` | none | `go.opentelemetry.io/otel`, OTel exporters, `otelecho`, `otelpgx` | Distributed tracing + Prometheus metrics + slog-to-OTel bridge; OTLP exporter |
-| MongoDB / Product Catalog | `extensions/mongodb/SPEC.md` | none | `go.mongodb.org/mongo-driver/v2` | Second bounded context `internal/product/` with variable schema; polyglot persistence (Postgres + MongoDB) |
-| Kafka | `extensions/messaging/SPEC.md` | Worker + Outbox (both ✅) | `github.com/twmb/franz-go/pkg/kgo`, `kfake` | Replaces `LogPublisher` with production `KafkaPublisher`; consumer group with at-least-once, DLQ, idempotent consumer |
+| gRPC | `extensions/grpc/SPEC.md` | ✅ Implemented | `google.golang.org/grpc`, `google.golang.org/protobuf` | Parallel gRPC transport alongside Echo; same Service/QueryService reused; recovery/logging/auth interceptors; server-side streaming |
+| OpenTelemetry | `extensions/observability/SPEC.md` | 🔲 Spec ready | `go.opentelemetry.io/otel`, OTel exporters, `otelecho`, `otelpgx` | Distributed tracing + Prometheus metrics + slog-to-OTel bridge; OTLP exporter |
+| MongoDB / Product Catalog | `extensions/mongodb/SPEC.md` | 🔲 Spec ready | `go.mongodb.org/mongo-driver/v2` | Second bounded context `internal/product/` with variable schema; polyglot persistence (Postgres + MongoDB) |
+| Kafka | `extensions/messaging/SPEC.md` | 🔲 Spec ready | `github.com/twmb/franz-go/pkg/kgo`, `kfake` | Replaces `LogPublisher` with production `KafkaPublisher`; consumer group with at-least-once, DLQ, idempotent consumer |
 
 ---
 
