@@ -54,7 +54,7 @@ npx skills add eduardo-sl/go-agent-skills
 | Health endpoint with cache status | ✅ Implemented | `internal/platform/server/server.go` |
 | Swagger/OpenAPI docs | ✅ Implemented | `docs/` (generated), annotations in handlers |
 | gRPC transport | ✅ Implemented | `internal/customer/grpc.go`, `internal/platform/grpc/`, `proto/`, `gen/` |
-| Kafka producer/consumer | 🔲 Spec ready, not implemented | `extensions/messaging/SPEC.md` |
+| Kafka producer/consumer | ✅ Implemented | `internal/platform/kafka/`, `internal/customer/events.go` |
 | OpenTelemetry (traces + metrics) | 🔲 Spec ready, not implemented | `extensions/observability/SPEC.md` |
 | MongoDB / Product Catalog context | ✅ Implemented | `internal/product/`, `internal/customer/preferences*.go`, `internal/platform/database/mongodb/` |
 
@@ -94,6 +94,8 @@ internal/customer/query.go                         — QueryService (direct DB, 
                                                      cache keys: "customer:<uuid>", "customer:list"; listTTL = max(ttl/5, 1m)
 internal/customer/handler.go                       — Echo handlers for 5 routes; querier interface (both QueryService and CachedQueryService
                                                      satisfy it); mapDomainError(); RegisterRoutes(); request/response types
+internal/customer/events.go                        — EventHandler: implements kafka.Handler; idempotent via sync.Map on message_id;
+                                                     routes CustomerRegistered/Updated/Removed; unknown types skipped (return nil)
 internal/customer/customer_test.go                 — Unit: TestNew (table-driven), TestService_Register; hand-crafted stubs; no HTTP/DB
 internal/customer/integration_test.go              — //go:build integration; testcontainers-go real Postgres; full CRUD
 internal/customer/cached_query_test.go             — Unit: CachedQueryService hit/miss/corruption/invalidation
@@ -186,6 +188,17 @@ internal/outbox/poller.go                          — Poller: Run(ctx) ticker l
                                                      deliver() → Publish → MarkProcessed or MarkFailed
 internal/outbox/log_publisher.go                   — LogPublisher: logs event_type/aggregate_id/payload via slog; dev/test only
 internal/outbox/poller_test.go                     — Unit: poll/deliver logic
+
+internal/platform/kafka/handler.go                 — Handler interface; HandlerFunc adapter; headerValue helper (pkg-private)
+internal/platform/kafka/producer.go                — Producer implements outbox.Publisher; kgo.StickyKeyPartitioner(AggregateID);
+                                                     SnappyCompression; AllISRAcks; retry loop → DLQWriter.Write on exhaustion
+internal/platform/kafka/consumer.go                — Consumer: ConsumerGroup + DisableAutoCommit + BlockRebalanceOnPoll;
+                                                     Run: AllowRebalance() ALWAYS first after PollFetches (avoids deadlock);
+                                                     batchFailed flag — offset NOT committed if any record fails
+internal/platform/kafka/dlq.go                     — DLQWriter: writes to dead letter topic with failure_reason+failed_at headers
+internal/platform/kafka/middleware.go              — Chain(); WithLogging(); WithRecovery() (panic→error); WithIdempotency() (sync.Map)
+internal/platform/kafka/kafka_test.go              — kfake tests: produce, DLQ write, consumer dispatch, error/no-commit, ctx cancel,
+                                                     idempotency, recovery, logging, chain order
 
 migrations/001_create_customers.sql                — customers table; pgcrypto extension
 migrations/002_create_users.sql                    — users table

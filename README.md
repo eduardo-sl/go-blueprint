@@ -6,6 +6,7 @@
 ![Echo](https://img.shields.io/badge/Echo-v4-blue)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)
 ![MongoDB](https://img.shields.io/badge/MongoDB-7.0-47A248?logo=mongodb&logoColor=white)
+![Kafka](https://img.shields.io/badge/Kafka-7.6-231F20?logo=apachekafka&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -101,6 +102,7 @@ Domain has zero infrastructure imports. The `postgres` package satisfies the `cu
 | MongoDB driver | `go.mongodb.org/mongo-driver/v2` | Product Catalog — flexible schema, text search |
 | SQLite (Event Log) | `modernc.org/sqlite` | Pure Go, no CGo |
 | Migrations | `github.com/pressly/goose/v3` | SQL-first, runs at startup |
+| Kafka client | `github.com/twmb/franz-go` | Pure Go, active maintenance, best API ergonomics |
 
 ### Auth & Validation
 
@@ -124,6 +126,7 @@ Domain has zero infrastructure imports. The `postgres` package satisfies the `cu
 |---|---|
 | Assertions | `github.com/stretchr/testify` — `assert` and `require` |
 | Integration tests | `github.com/testcontainers/testcontainers-go` — real Postgres in Docker |
+| Kafka tests | `github.com/twmb/franz-go/pkg/kfake` — in-process Kafka fake, no Docker |
 
 ---
 
@@ -142,6 +145,7 @@ go-blueprint/
 │   │   ├── service.go           # Write side: Register, Update, Remove
 │   │   ├── query.go             # Read side: GetByID, List
 │   │   ├── handler.go           # Echo HTTP handlers + route registration
+│   │   ├── events.go            # EventHandler: idempotent Kafka consumer for customer events
 │   │   ├── preferences.go       # CustomerPreferences entity + PreferencesRepository interface
 │   │   ├── preferences_service.go # Write/read: Upsert, GetByCustomerID
 │   │   ├── preferences_handler.go # Echo handlers for GET/PUT /customers/:id/preferences
@@ -181,6 +185,13 @@ go-blueprint/
 │       │       ├── users.sql.go       # Generated user queries
 │       │       ├── customer_repo.go   # Adapter: pgtype ↔ domain time.Time
 │       │       └── user_repo.go       # Adapter: pgtype ↔ domain time.Time
+│       ├── kafka/               # Kafka producer, consumer, DLQ, middleware
+│       │   ├── producer.go      # Producer: implements outbox.Publisher; retry + DLQ
+│       │   ├── consumer.go      # Consumer group: at-least-once, manual offset commit
+│       │   ├── dlq.go           # DLQWriter: failed messages → dead letter topic
+│       │   ├── handler.go       # Handler interface + HandlerFunc adapter
+│       │   ├── middleware.go    # Chain(), WithLogging(), WithRecovery(), WithIdempotency()
+│       │   └── kafka_test.go    # Unit tests using kfake (no Docker)
 │       ├── middleware/          # Echo middlewares (RequestID, slog, CORS, Recover)
 │       └── server/server.go     # Echo setup, route registration, graceful shutdown
 │
@@ -516,6 +527,8 @@ make lint
 | `docker-down` | `docker compose down` | Stop Postgres |
 | `proto` | `protoc ...` | Regenerate `gen/` from `.proto` files |
 | `grpc-test` | `grpcurl ...` | Smoke-test the running gRPC server |
+| `kafka-topics` | `docker exec ...` | Create `customers.events` and `customers.events.dlq` |
+| `kafka-consume` | `docker exec ...` | Tail `customers.events` with headers |
 
 ---
 
@@ -536,6 +549,12 @@ Copy `.env.example` to `.env`:
 | `GRPC_ADDR` | `:9090` | No | gRPC server listen address |
 | `MONGO_URI` | `mongodb://localhost:27017` | No | MongoDB connection string for the Product Catalog |
 | `MONGO_DATABASE` | `go_blueprint` | No | MongoDB database name |
+| `KAFKA_ENABLED` | `false` | No | Set `true` to activate Kafka integration |
+| `KAFKA_BROKERS` | `localhost:9092` | No | Comma-separated broker list |
+| `KAFKA_TOPIC_CUSTOMERS` | `customers.events` | No | Topic for customer domain events |
+| `KAFKA_DLQ_TOPIC` | `customers.events.dlq` | No | Dead letter topic |
+| `KAFKA_CONSUMER_GROUP` | `go-blueprint` | No | Consumer group ID |
+| `KAFKA_PRODUCER_RETRIES` | `3` | No | Max produce attempts before DLQ |
 
 ---
 
@@ -593,6 +612,48 @@ curl -s "http://localhost:8080/api/v1/products?category=clothing&attributes[mate
 ```
 
 See [`docs/mongodb.md`](docs/mongodb.md) for the full reference.
+
+---
+
+## Kafka Messaging
+
+When `KAFKA_ENABLED=true`, the outbox poller delivers domain events to Kafka instead of
+logging them. A consumer runs in the same process to demonstrate the full
+producer–broker–consumer cycle.
+
+```bash
+# Start Kafka alongside the other services
+docker compose up -d kafka zookeeper
+
+# Enable Kafka in .env
+KAFKA_ENABLED=true
+
+# Run the server
+make run
+# → level=INFO msg="kafka enabled" brokers=localhost:9092 topic=customers.events
+
+# Register a customer to trigger an event
+TOKEN=$(curl -s -X POST localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"supersecret123"}' | jq -r '.token')
+
+curl -s -X POST localhost:8080/api/v1/customers \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Bob","email":"bob@example.com","birth_date":"1990-01-01"}'
+
+# Watch the event arrive
+make kafka-consume
+```
+
+**Key properties:**
+- Aggregate ID is the Kafka partition key — events for the same customer are ordered
+- Snappy compression + `AllISRAcks` for durability
+- Retry with exponential backoff; DLQ on exhaustion
+- At-least-once delivery with manual offset commit
+- `EventHandler` is idempotent via `message_id` header dedup
+
+See [`docs/messaging.md`](docs/messaging.md) for the complete reference.
 
 ---
 
