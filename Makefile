@@ -1,4 +1,4 @@
-.PHONY: run build test test-integration lint generate migrate migrate-down swagger docker-up docker-down jaeger metrics
+.PHONY: run build test test-integration lint generate migrate migrate-down swagger docker-up docker-down jaeger metrics proto grpc-test
 
 run:
 	go run ./cmd/api
@@ -39,3 +39,16 @@ jaeger:
 
 metrics:
 	curl -s http://localhost:9091/metrics | grep go_blueprint
+
+proto:
+	protoc \
+	  -I proto \
+	  --go_out=gen --go_opt=paths=source_relative \
+	  --go-grpc_out=gen --go-grpc_opt=paths=source_relative \
+	  customer/v1/customer.proto
+
+grpc-test:
+	grpcurl -plaintext localhost:9090 list
+	grpcurl -plaintext \
+	  -H "Authorization: Bearer $$TOKEN" \
+	  localhost:9090 customer.v1.CustomerService/ListCustomers
