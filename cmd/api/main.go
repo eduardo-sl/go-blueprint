@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database/mongodb"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/database/postgres"
 	grpcserver "github.com/eduardo-sl/go-blueprint/internal/platform/grpc"
+	kafkaplatform "github.com/eduardo-sl/go-blueprint/internal/platform/kafka"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/server"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
 	"github.com/eduardo-sl/go-blueprint/internal/product"
@@ -122,9 +124,49 @@ func main() {
 	// Step 1 of graceful shutdown: worker pool — started first, stopped last.
 	workerPool := worker.New(ctx, cfg.WorkerCount, cfg.WorkerQueue, logger)
 
-	// Outbox store and poller
+	// Outbox store and publisher.
+	// Default publisher is LogPublisher (dev/test). Replaced by KafkaProducer when enabled.
 	outboxStore := outbox.NewPostgresStore(pool)
-	publisher := outbox.NewLogPublisher(logger) // swap for KafkaPublisher in production
+	var publisher outbox.Publisher = outbox.NewLogPublisher(logger)
+
+	if cfg.KafkaEnabled {
+		brokers := strings.Split(cfg.KafkaBrokers, ",")
+
+		dlqWriter, err := kafkaplatform.NewDLQWriter(brokers, cfg.KafkaDLQTopic, logger)
+		if err != nil {
+			logger.Error("failed to init kafka DLQ writer", slog.Any("error", err))
+			os.Exit(1)
+		}
+		defer dlqWriter.Close()
+
+		kafkaProducer, err := kafkaplatform.NewProducer(
+			brokers, cfg.KafkaTopicCustomers, dlqWriter, cfg.KafkaProducerRetries, logger,
+		)
+		if err != nil {
+			logger.Error("failed to init kafka producer", slog.Any("error", err))
+			os.Exit(1)
+		}
+		defer kafkaProducer.Close()
+		publisher = kafkaProducer
+
+		eventHandler := customer.NewEventHandler(logger)
+		kafkaConsumer, err := kafkaplatform.NewConsumer(
+			brokers, cfg.KafkaConsumerGroup, cfg.KafkaTopicCustomers, eventHandler, logger,
+		)
+		if err != nil {
+			logger.Error("failed to init kafka consumer", slog.Any("error", err))
+			os.Exit(1)
+		}
+		go kafkaConsumer.Run(ctx)
+		defer kafkaConsumer.Close()
+
+		logger.Info("kafka enabled",
+			slog.String("brokers", cfg.KafkaBrokers),
+			slog.String("topic", cfg.KafkaTopicCustomers),
+			slog.String("group", cfg.KafkaConsumerGroup),
+		)
+	}
+
 	poller := outbox.NewPoller(
 		outboxStore,
 		publisher,
