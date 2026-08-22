@@ -10,36 +10,36 @@ import (
 )
 
 type Config struct {
-	Env          string        `mapstructure:"env"`
-	Addr         string        `mapstructure:"addr"`
-	DatabaseURL  string        `mapstructure:"database_url"`
-	EventLogPath string        `mapstructure:"event_log_path"`
-	JWTSecret    string        `mapstructure:"jwt_secret"`
-	JWTExpiry    time.Duration `mapstructure:"jwt_expiry"`
-	LogLevel     string        `mapstructure:"log_level"`
-	RedisAddr     string        `mapstructure:"redis_addr"`
-	RedisPassword string        `mapstructure:"redis_password"`
-	RedisDB       int           `mapstructure:"redis_db"`
-	CacheTTL      time.Duration `mapstructure:"cache_ttl"`
-	WorkerCount        int           `mapstructure:"worker_count"`
-	WorkerQueue        int           `mapstructure:"worker_queue"`
-	WorkerDrainTimeout time.Duration `mapstructure:"worker_drain_timeout"`
-	OutboxInterval int `mapstructure:"outbox_interval"` // seconds
-	OutboxBatch    int `mapstructure:"outbox_batch"`
-	OTelEnabled     bool   `mapstructure:"otel_enabled"`
-	OTelServiceName string `mapstructure:"otel_service_name"`
-	OTelEndpoint    string `mapstructure:"otel_endpoint"`
-	MetricsAddr     string `mapstructure:"metrics_addr"`
-	GRPCEnabled bool   `mapstructure:"grpc_enabled"`
-	GRPCAddr    string `mapstructure:"grpc_addr"`
-	MongoURI      string `mapstructure:"mongo_uri"`
-	MongoDatabase string `mapstructure:"mongo_database"`
-	KafkaEnabled         bool   `mapstructure:"kafka_enabled"`
-	KafkaBrokers         string `mapstructure:"kafka_brokers"`
-	KafkaTopicCustomers  string `mapstructure:"kafka_topic_customers"`
-	KafkaDLQTopic        string `mapstructure:"kafka_dlq_topic"`
-	KafkaConsumerGroup   string `mapstructure:"kafka_consumer_group"`
-	KafkaProducerRetries int    `mapstructure:"kafka_producer_retries"`
+	Env                  string        `mapstructure:"env"`
+	Addr                 string        `mapstructure:"addr"`
+	DatabaseURL          string        `mapstructure:"database_url"`
+	EventLogPath         string        `mapstructure:"event_log_path"`
+	JWTSecret            string        `mapstructure:"jwt_secret"`
+	JWTExpiry            time.Duration `mapstructure:"jwt_expiry"`
+	LogLevel             string        `mapstructure:"log_level"`
+	RedisAddr            string        `mapstructure:"redis_addr"`
+	RedisPassword        string        `mapstructure:"redis_password"`
+	RedisDB              int           `mapstructure:"redis_db"`
+	CacheTTL             time.Duration `mapstructure:"cache_ttl"`
+	WorkerCount          int           `mapstructure:"worker_count"`
+	WorkerQueue          int           `mapstructure:"worker_queue"`
+	WorkerDrainTimeout   time.Duration `mapstructure:"worker_drain_timeout"`
+	OutboxInterval       int           `mapstructure:"outbox_interval"` // seconds
+	OutboxBatch          int           `mapstructure:"outbox_batch"`
+	OTelEnabled          bool          `mapstructure:"otel_enabled"`
+	OTelServiceName      string        `mapstructure:"otel_service_name"`
+	OTelEndpoint         string        `mapstructure:"otel_endpoint"`
+	MetricsAddr          string        `mapstructure:"metrics_addr"`
+	GRPCEnabled          bool          `mapstructure:"grpc_enabled"`
+	GRPCAddr             string        `mapstructure:"grpc_addr"`
+	MongoURI             string        `mapstructure:"mongo_uri"`
+	MongoDatabase        string        `mapstructure:"mongo_database"`
+	KafkaEnabled         bool          `mapstructure:"kafka_enabled"`
+	KafkaBrokers         string        `mapstructure:"kafka_brokers"`
+	KafkaTopicCustomers  string        `mapstructure:"kafka_topic_customers"`
+	KafkaDLQTopic        string        `mapstructure:"kafka_dlq_topic"`
+	KafkaConsumerGroup   string        `mapstructure:"kafka_consumer_group"`
+	KafkaProducerRetries int           `mapstructure:"kafka_producer_retries"`
 }
 
 func Load() (*Config, error) {
