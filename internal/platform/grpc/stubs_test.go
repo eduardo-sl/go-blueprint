@@ -16,10 +16,9 @@ import (
 // noopRepo satisfies customer.Repository for tests that do not need real persistence.
 type noopRepo struct{}
 
-func (r *noopRepo) Save(_ context.Context, _ customer.Customer) error { return nil }
-func (r *noopRepo) SaveTx(_ context.Context, _ pgx.Tx, _ customer.Customer) error { return nil }
-func (r *noopRepo) Update(_ context.Context, _ customer.Customer) error { return nil }
-func (r *noopRepo) Delete(_ context.Context, _ uuid.UUID) error { return nil }
+func (r *noopRepo) SaveTx(_ context.Context, _ pgx.Tx, _ customer.Customer) error   { return nil }
+func (r *noopRepo) UpdateTx(_ context.Context, _ pgx.Tx, _ customer.Customer) error { return nil }
+func (r *noopRepo) DeleteTx(_ context.Context, _ pgx.Tx, _ uuid.UUID) error         { return nil }
 func (r *noopRepo) FindByID(_ context.Context, _ uuid.UUID) (customer.Customer, error) {
 	return customer.Customer{}, customer.ErrNotFound
 }
@@ -55,7 +54,7 @@ func (n *noopOutboxStore) SaveTx(_ context.Context, _ pgx.Tx, _ outbox.OutboxMes
 func (n *noopOutboxStore) FetchUnprocessed(_ context.Context, _ int) ([]outbox.OutboxMessage, error) {
 	return nil, nil
 }
-func (n *noopOutboxStore) MarkProcessed(_ context.Context, _ uuid.UUID) error { return nil }
+func (n *noopOutboxStore) MarkProcessed(_ context.Context, _ uuid.UUID) error        { return nil }
 func (n *noopOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error { return nil }
 
 // noopAuthRepo satisfies auth.Repository.

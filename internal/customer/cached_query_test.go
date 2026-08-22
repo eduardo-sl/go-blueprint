@@ -64,17 +64,14 @@ type countingRepo struct {
 	getCalls int
 }
 
-func (r *countingRepo) Save(ctx context.Context, c customer.Customer) error {
-	return r.inner.Save(ctx, c)
-}
 func (r *countingRepo) SaveTx(ctx context.Context, tx pgx.Tx, c customer.Customer) error {
 	return r.inner.SaveTx(ctx, tx, c)
 }
-func (r *countingRepo) Update(ctx context.Context, c customer.Customer) error {
-	return r.inner.Update(ctx, c)
+func (r *countingRepo) UpdateTx(ctx context.Context, tx pgx.Tx, c customer.Customer) error {
+	return r.inner.UpdateTx(ctx, tx, c)
 }
-func (r *countingRepo) Delete(ctx context.Context, id uuid.UUID) error {
-	return r.inner.Delete(ctx, id)
+func (r *countingRepo) DeleteTx(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
+	return r.inner.DeleteTx(ctx, tx, id)
 }
 func (r *countingRepo) FindByEmail(ctx context.Context, email string) (customer.Customer, error) {
 	return r.inner.FindByEmail(ctx, email)
@@ -101,7 +98,7 @@ func seedCustomer(t *testing.T, repo *mockRepo) customer.Customer {
 	t.Helper()
 	c, err := customer.New("Alice", "alice@example.com", time.Now().AddDate(-20, 0, 0))
 	require.NoError(t, err)
-	require.NoError(t, repo.Save(context.Background(), c))
+	repo.seed(c)
 	return c
 }
 
