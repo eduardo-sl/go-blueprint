@@ -216,14 +216,20 @@ func toResponse(c Customer) customerResponse {
 	}
 }
 
+// mapDomainError turns a domain sentinel into the HTTP status that matches it.
+//
+// The body is the sentinel's own text, not err.Error(): every layer wraps on the
+// way up, so err.Error() would ship "customer.Service.Update: find customer:
+// ..." — package and function names — to the client. The wrapped chain belongs
+// in the log line at this boundary; the client gets the stable domain message.
 func mapDomainError(err error) error {
 	switch {
 	case errors.Is(err, ErrNotFound):
-		return echo.NewHTTPError(http.StatusNotFound, err.Error())
+		return echo.NewHTTPError(http.StatusNotFound, ErrNotFound.Error())
 	case errors.Is(err, ErrEmailExists):
-		return echo.NewHTTPError(http.StatusConflict, err.Error())
+		return echo.NewHTTPError(http.StatusConflict, ErrEmailExists.Error())
 	case errors.Is(err, ErrInvalidBirthDate):
-		return echo.NewHTTPError(http.StatusUnprocessableEntity, err.Error())
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, ErrInvalidBirthDate.Error())
 	default:
 		return echo.NewHTTPError(http.StatusInternalServerError, "internal error")
 	}
