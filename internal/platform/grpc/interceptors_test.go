@@ -95,6 +95,38 @@ func TestAuthInterceptor_InvalidToken(t *testing.T) {
 	assert.Equal(t, codes.Unauthenticated, status.Code(err))
 }
 
+// TestAuthInterceptor_NonBearerScheme pins the distinction the interceptor used
+// to lose: TrimPrefix passed a Basic credential through untouched, so the wrong
+// scheme was reported as a bad token. The status message is the assertion —
+// both cases are Unauthenticated.
+func TestAuthInterceptor_NonBearerScheme(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{name: "basic credentials", header: "Basic dXNlcjpwYXNzd29yZA=="},
+		{name: "token scheme", header: "Token abcdefghij"},
+		{name: "bare token, no scheme", header: "abcdefghij"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authSvc := newAuthSvc(t)
+			client, cleanup := newTestServer(t, authSvc)
+			defer cleanup()
+
+			md := metadata.Pairs("authorization", tt.header)
+			ctx := metadata.NewOutgoingContext(context.Background(), md)
+
+			_, err := client.ListCustomers(ctx, &customerv1.ListCustomersRequest{})
+			require.Error(t, err)
+			assert.Equal(t, codes.Unauthenticated, status.Code(err))
+			assert.Equal(t, "missing authorization", status.Convert(err).Message(),
+				"a non-Bearer scheme is missing credentials, not a bad token")
+		})
+	}
+}
+
 func TestAuthInterceptor_ValidToken(t *testing.T) {
 	authSvc := newAuthSvc(t)
 	client, cleanup := newTestServer(t, authSvc)
