@@ -90,6 +90,12 @@
       "source": "eduardo-sl/go-agent-skills",
       "sourceType": "github",
       "computedHash": "db284e9ae3d9a90852e0bf7a0f2cabf67d780d620e6a7d38fc2f6cb34d6599e8"
+    },
+    "spec-writer": {
+      "source": "eduardo-sl/spec-writer",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "87663227cd64d8990733f17c0014e126c1ab99f21e47af1a7acda7ab930290b8"
     }
   }
 }
