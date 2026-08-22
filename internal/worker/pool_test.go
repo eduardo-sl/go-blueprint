@@ -31,8 +31,9 @@ func TestPool_SubmitWithinCapacity(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	p.Stop()
+	drained := p.Stop()
 	assert.Equal(t, int64(5), count.Load())
+	assert.Equal(t, 5, drained, "Stop reports the jobs it drained")
 }
 
 func TestPool_SubmitOverCapacity(t *testing.T) {
@@ -55,25 +56,65 @@ func TestPool_SubmitOverCapacity(t *testing.T) {
 	p.Stop()
 }
 
-func TestPool_ContextCancelledStopsWorkers(t *testing.T) {
+// TestPool_QueuedJobsSurviveShutdown is the R6 regression. It deliberately
+// passes the cancelled context straight to New — the way main used to wire the
+// pool — because that is the shape the defect needed: with a ctx.Done() case in
+// run, the workers return the moment the context dies and everything still
+// buffered in the queue is silently dropped. Stop's contract is that the queue
+// drains regardless of what happened to the context it was given.
+func TestPool_QueuedJobsSurviveShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	p := worker.New(ctx, 3, 10, nopLogger())
+	defer cancel()
+
+	p := worker.New(ctx, 1, 10, nopLogger())
 
 	var count atomic.Int64
-	done := make(chan struct{})
+	release := make(chan struct{})
+	for range 10 {
+		require.NoError(t, p.Submit(func(context.Context) error {
+			<-release // hold the single worker until every job is queued
+			count.Add(1)
+			return nil
+		}))
+	}
 
-	err := p.Submit(func(ctx context.Context) error {
-		defer close(done)
-		count.Add(1)
-		return nil
-	})
-	require.NoError(t, err)
-
-	<-done // in-flight job finished
 	cancel()
-	p.Stop() // must not deadlock
+	close(release)
 
-	assert.Equal(t, int64(1), count.Load())
+	drained := p.Stop()
+
+	assert.Equal(t, int64(10), count.Load(), "queued jobs were dropped on shutdown")
+	assert.Equal(t, 10, drained)
+}
+
+// TestPool_DrainedJobHasLiveContext is the R7 regression: it pins the wiring
+// main uses. The pool hands jobs exactly the context New was given, so deriving
+// it with WithoutCancel is what keeps a drained outbox delivery able to reach
+// Kafka and Postgres after the signal. Draining into the cancelled lifecycle
+// context would make every drained job fail at its first call.
+func TestPool_DrainedJobHasLiveContext(t *testing.T) {
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+
+	jobCtx, cancelJobs := context.WithTimeout(
+		context.WithoutCancel(lifecycle), 5*time.Second,
+	)
+	defer cancelJobs()
+
+	p := worker.New(jobCtx, 1, 10, nopLogger())
+
+	release := make(chan struct{})
+	observed := make(chan error, 1)
+	require.NoError(t, p.Submit(func(ctx context.Context) error {
+		<-release
+		observed <- ctx.Err()
+		return nil
+	}))
+
+	cancelLifecycle()
+	close(release)
+	p.Stop()
+
+	require.NoError(t, <-observed, "drained job ran with a cancelled context")
 }
 
 func TestPool_JobError_PoolContinues(t *testing.T) {
