@@ -31,3 +31,7 @@ Thumbs.db
 
 # project instructions (not source code)
 CLAUDE.md
+specs/
+
+# agent tooling artifacts (empty marker file, not source)
+.codex
