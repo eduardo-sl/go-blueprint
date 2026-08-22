@@ -85,10 +85,10 @@ cmd/api/main.go                                    — Entry point: wires all de
 
 internal/customer/domain.go                        — Customer struct; New(); Update(); sentinel errors: ErrNotFound, ErrEmailExists,
                                                      ErrInvalidBirthDate, ErrNameRequired, ErrEmailRequired; internal validate* funcs
-internal/customer/repository.go                    — Repository interface (consumer-defined): Save, SaveTx(pgx.Tx), Update, Delete,
-                                                     FindByID, FindByEmail, List
-internal/customer/service.go                       — Write side: Service struct; Register (fully atomic tx: SaveTx + outbox in same pgx.Tx);
-                                                     Update (outbox-in-tx, repo.Update non-tx — NOT fully atomic); Remove (same caveat);
+internal/customer/repository.go                    — Repository interface (consumer-defined): SaveTx/UpdateTx/DeleteTx (all pgx.Tx —
+                                                     writes are transaction-scoped only), FindByID, FindByEmail, List
+internal/customer/service.go                       — Write side: Service struct; Register/Update/Remove are each fully atomic —
+                                                     {Save,Update,Delete}Tx + outbox SaveTx share one pgx.Tx, then Commit;
                                                      Beginner interface; invalidate() on Update/Remove; appendEvent to SQLite post-commit
 internal/customer/query.go                         — QueryService (direct DB, no side effects); CachedQueryService (wraps QueryService);
                                                      cache keys: "customer:<uuid>", "customer:list"; listTTL = max(ttl/5, 1m)
@@ -96,6 +96,7 @@ internal/customer/handler.go                       — Echo handlers for 5 route
                                                      satisfy it); mapDomainError(); RegisterRoutes(); request/response types
 internal/customer/events.go                        — EventHandler: implements kafka.Handler; idempotent via sync.Map on message_id;
                                                      routes CustomerRegistered/Updated/Removed; unknown types skipped (return nil)
+internal/customer/service_tx_test.go               — Unit: Update/Remove write on the service tx; rollback pairs both writes
 internal/customer/customer_test.go                 — Unit: TestNew (table-driven), TestService_Register; hand-crafted stubs; no HTTP/DB
 internal/customer/integration_test.go              — //go:build integration; testcontainers-go real Postgres; full CRUD
 internal/customer/cached_query_test.go             — Unit: CachedQueryService hit/miss/corruption/invalidation
@@ -137,7 +138,9 @@ internal/platform/database/postgres/db.go          — sqlc-generated: Queries s
 internal/platform/middleware/middleware.go          — Register(e, logger): RequestID, Recover, CORS, slog request logger
 internal/platform/server/server.go                 — Start(ctx, cfg, customerHandler, authHandler, appCache, workerPool, logger);
                                                      CachePinger interface; healthCheck handler (reports cache status);
-                                                     /swagger/* route; 10s shutdown timeout
+                                                     /swagger/* route; 10s shutdown timeout via srv.Shutdown (srv owns the
+                                                     listener and the Read/Write/Idle timeouts — never e.Shutdown)
+internal/platform/server/server_test.go            — Unit: in-flight request drains before Start returns; drain timeout surfaces an error
 
 internal/customer/preferences.go                   — CustomerPreferences struct; PreferencesRepository interface (consumer-side); ErrPreferencesNotFound
 internal/customer/preferences_service.go           — PreferencesService: Upsert, GetByCustomerID
@@ -171,23 +174,30 @@ internal/platform/grpc/server.go                   — NewServer: ChainUnaryInte
 internal/platform/grpc/interceptors.go             — recoveryInterceptor, loggingInterceptor, authInterceptor (unary + streaming variants);
                                                      extractToken helper; wrappedStream injects auth context into streaming calls
 
-internal/worker/pool.go                            — Pool; Job func(ctx context.Context) error; ErrPoolFull; New starts goroutines
-                                                     immediately; Submit non-blocking; Stop closes channel + wg.Wait()
+internal/worker/pool.go                            — Pool; Job func(ctx context.Context) error; ErrPoolFull; New(jobCtx, ...) starts
+                                                     goroutines immediately and run() ranges over the channel (no ctx.Done() case,
+                                                     so Stop is mandatory); Submit non-blocking; Stop closes channel + wg.Wait()
+                                                     and returns the drained job count
 internal/worker/doc.go                             — Package-level godoc
-internal/worker/pool_test.go                       — Unit: submit, drain, backpressure, Stop
+internal/worker/pool_test.go                       — Unit: submit, drain, backpressure, Stop; queued jobs survive shutdown;
+                                                     drained jobs get a live context
 
 internal/outbox/outbox.go                          — OutboxMessage struct (ID, AggregateID, EventType, Payload json.RawMessage,
                                                      CreatedAt, ProcessedAt *time.Time, Attempts, LastError *string);
                                                      Publisher interface (Publish)
-internal/outbox/store.go                           — OutboxStore interface: SaveTx(pgx.Tx), FetchUnprocessed, MarkProcessed, MarkFailed
+internal/outbox/store.go                           — OutboxStore interface: SaveTx(pgx.Tx), ClaimBatch(limit, reclaimAfter),
+                                                     MarkProcessed, MarkFailed
 internal/outbox/postgres.go                        — PostgresOutboxStore: SaveTx inserts into outbox_messages;
-                                                     FetchUnprocessed uses FOR UPDATE SKIP LOCKED;
-                                                     MarkProcessed sets processed_at; MarkFailed increments attempts
-internal/outbox/poller.go                          — Poller: Run(ctx) ticker loop; poll() fetches batch, submits each msg as
-                                                     worker.Job; returns early on ErrPoolFull (next tick retries);
+                                                     ClaimBatch = one UPDATE ... (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING,
+                                                     setting locked_at so concurrent pollers get disjoint batches;
+                                                     MarkProcessed sets processed_at; MarkFailed increments attempts and
+                                                     clears locked_at so the message retries next tick
+internal/outbox/poller.go                          — Poller: Run(ctx) ticker loop; _reclaimAfter = 5m; poll() claims a batch and
+                                                     submits each msg as worker.Job; returns early on ErrPoolFull (next tick retries);
                                                      deliver() → Publish → MarkProcessed or MarkFailed
 internal/outbox/log_publisher.go                   — LogPublisher: logs event_type/aggregate_id/payload via slog; dev/test only
 internal/outbox/poller_test.go                     — Unit: poll/deliver logic
+internal/outbox/integration_test.go                — [integration] concurrent claim, abandoned-lock reclaim, MarkFailed release
 
 internal/platform/kafka/handler.go                 — Handler interface; HandlerFunc adapter; headerValue helper (pkg-private)
 internal/platform/kafka/producer.go                — Producer implements outbox.Publisher; kgo.StickyKeyPartitioner(AggregateID);
@@ -288,20 +298,23 @@ cmd/api/main.go                         [wiring only, no business logic]
 
 - **Message type**: `internal/outbox/outbox.go` → `OutboxMessage`
 - **Store interface**: `internal/outbox/store.go` → `OutboxStore`; `SaveTx` takes `pgx.Tx` — calling outside a transaction defeats the pattern
-- **Postgres impl**: `internal/outbox/postgres.go` → `PostgresOutboxStore`; `FetchUnprocessed` uses `FOR UPDATE SKIP LOCKED` — do not remove; prevents duplicate delivery across replicas
-- **Poller**: `internal/outbox/poller.go` → `Poller.Run(ctx)` ticker; `poll()` submits each msg as `worker.Job`; stops batch on `ErrPoolFull` (next tick retries)
+- **Postgres impl**: `internal/outbox/postgres.go` → `PostgresOutboxStore`; `ClaimBatch` is a single `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING ...` — the claim and the lock write must stay in one statement, otherwise the locks release when the rows are returned and two replicas claim the same messages
+- **Claim window**: `locked_at TIMESTAMPTZ` marks a claimed row; a lock older than `_reclaimAfter` (5m, `internal/outbox/poller.go`) is treated as abandoned and re-claimed, so a poller that dies mid-flight does not strand its batch
+- **Release on failure**: `MarkFailed` clears `locked_at` along with recording the error — without that the message stays claimed for the full reclaim window instead of retrying on the next tick
+- **Poller**: `internal/outbox/poller.go` → `Poller.Run(ctx)` ticker; `poll()` calls `ClaimBatch` then submits each msg as `worker.Job`; stops batch on `ErrPoolFull` (next tick retries)
 - **Publisher interface**: `internal/outbox/outbox.go` → `Publisher`
 - **Dev publisher**: `internal/outbox/log_publisher.go` → `LogPublisher` — logs and returns nil; replace with `KafkaPublisher` for production
-- **Atomicity — Register**: `internal/customer/service.go` → `Service.Register()` — `repo.SaveTx(ctx, tx, c)` and `outboxStore.SaveTx(ctx, tx, msg)` share the same `pgx.Tx`, then `tx.Commit()`. Fully atomic.
-- **Atomicity — Update/Remove (caveat)**: `repo.Update`/`repo.Delete` are called without a transaction; the outbox write uses a separate `tx`. These two operations are NOT atomic in the current implementation.
+- **Atomicity — all three writes**: `Register`, `Update` and `Remove` in `internal/customer/service.go` each pair `repo.{Save,Update,Delete}Tx(ctx, tx, …)` with `outboxStore.SaveTx(ctx, tx, msg)` on the same `pgx.Tx`, then `tx.Commit()`. A write that cannot record its event does not commit.
+- **Why there is no non-transactional write**: `customer.Repository` exposes `SaveTx`/`UpdateTx`/`DeleteTx` and nothing else for writes. A plain `Save`/`Update` would be a silent way to break the pairing above, so the interface does not offer one.
 - **Post-commit**: after `tx.Commit`, `Service.appendEvent` writes to SQLite event log — best-effort, errors logged but not returned
 
 ### Worker Pool
 
 - **Impl**: `internal/worker/pool.go` → `Pool`, `Job func(ctx context.Context) error`, `ErrPoolFull`
-- **Lifecycle**: `New(ctx, workers, queueSize, logger)` starts goroutines immediately; workers exit on `ctx.Done()` or channel close
+- **Lifecycle**: `New(jobCtx, workers, queueSize, logger)` starts goroutines immediately; `run` ranges over the job channel, so workers exit **only** on channel close. `Stop()` is mandatory — without it the goroutines leak
+- **Job context ≠ lifecycle context**: the ctx passed to `New` is handed to every job and must survive the shutdown signal. `main.go` derives it with `context.WithoutCancel(ctx)` bounded by `cfg.WorkerDrainTimeout`; a cancelled job context would make every drained job fail at its first network or DB call
 - **Backpressure**: `Submit()` is non-blocking; returns `ErrPoolFull` when buffered channel is full
-- **Shutdown**: `Stop()` closes the job channel then `wg.Wait()` — no work is dropped; always call `Stop()` after context cancellation
+- **Shutdown**: `Stop()` closes the job channel then `wg.Wait()`, and returns how many jobs it drained — no work is dropped, including jobs still sitting in the queue
 
 ### CQRS (explicit, no mediator)
 
@@ -343,6 +356,7 @@ cmd/api/main.go                         [wiring only, no business logic]
 | `CACHE_TTL` | `CacheTTL` | `"5m"` | cache | No (parsed as `time.Duration`) |
 | `WORKER_COUNT` | `WorkerCount` | `4` | worker | No |
 | `WORKER_QUEUE` | `WorkerQueue` | `100` | worker | No (buffered channel size) |
+| `WORKER_DRAIN_TIMEOUT` | `WorkerDrainTimeout` | `"15s"` | worker | No — upper bound on the post-signal drain; must exceed the 10s HTTP drain |
 | `OUTBOX_INTERVAL` | `OutboxInterval` | `5` | outbox | No (seconds between polls) |
 | `OUTBOX_BATCH` | `OutboxBatch` | `50` | outbox | No (max messages per poll) |
 | `GRPC_ENABLED` | `GRPCEnabled` | `false` | grpc | No — `true` starts gRPC server alongside HTTP |
@@ -362,7 +376,7 @@ Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) p
 | `users` | `id UUID PK`, `email TEXT UNIQUE`, `password_hash TEXT`, `name TEXT`, `created_at TIMESTAMPTZ` | `002_create_users.sql` | Auth domain |
 | `event_log` (Postgres) | `id TEXT PK`, `aggregate_id TEXT`, `event_type TEXT`, `payload JSONB`, `occurred_at TIMESTAMPTZ`; index on `aggregate_id` | `003_create_event_log.sql` | Schema only — runtime uses SQLite |
 | `event_log` (SQLite) | same columns, `payload TEXT`, `occurred_at DATETIME`; auto-migrated by `eventlog.NewSQLiteStore`; stored at `cfg.EventLogPath` (`./data/events.db`) | inline in `eventlog/sqlite.go` | EventLog (actual runtime) |
-| `outbox_messages` | `id UUID PK`, `aggregate_id UUID`, `event_type TEXT`, `payload JSONB`, `created_at TIMESTAMPTZ`, `processed_at TIMESTAMPTZ NULL`, `attempts INT DEFAULT 0`, `last_error TEXT NULL`; partial index on `created_at WHERE processed_at IS NULL` | `004_create_outbox.sql` | Outbox |
+| `outbox_messages` | `id UUID PK`, `aggregate_id UUID`, `event_type TEXT`, `payload JSONB`, `created_at TIMESTAMPTZ`, `processed_at TIMESTAMPTZ NULL`, `attempts INT DEFAULT 0`, `last_error TEXT NULL`, `locked_at TIMESTAMPTZ NULL`; partial index `idx_outbox_claimable` on `created_at WHERE processed_at IS NULL` | `004_create_outbox.sql`, `005_outbox_locking.sql` | Outbox |
 
 ---
 
@@ -378,7 +392,9 @@ Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) p
 7.  eventlog.NewSQLiteStore(cfg.EventLogPath) — opens SQLite, runs inline DDL migration
 8.  cache.NoopCache{} or cache.NewRedisCache — conditional on cfg.RedisAddr != "";
                                               WARN + fallback to NoopCache on ping failure
-9.  worker.New(ctx, cfg.WorkerCount, cfg.WorkerQueue, logger) — goroutines start immediately
+9.  worker.New(drainCtx, cfg.WorkerCount, cfg.WorkerQueue, logger) — goroutines start immediately;
+                                              drainCtx = WithTimeout(WithoutCancel(ctx), cfg.WorkerDrainTimeout)
+                                              so drained jobs still reach Postgres and Kafka after the signal
 10. outbox.NewPostgresStore(pool)           — no I/O at construction
 11. outbox.NewLogPublisher(logger)          — no I/O at construction
 12. outbox.NewPoller(store, publisher, pool, interval, batch, logger)
@@ -398,9 +414,9 @@ Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) p
 26. [if cfg.GRPCEnabled] grpcserver.NewServer(handler, authSvc, logger)
 27. [if cfg.GRPCEnabled] go grpcSrv.Serve(lis)  — gRPC server goroutine
 28. server.Start(ctx, cfg, customerHandler, preferencesHandler, authHandler, productHandler, cache, workerPool, logger) — BLOCKS
-29. [ctx cancelled] server.Start returns after Echo drains (10s timeout)
+29. [ctx cancelled] server.Start returns after srv.Shutdown drains in-flight requests (10s timeout)
 30. [if cfg.GRPCEnabled] grpcSrv.GracefulStop() — waits for in-flight gRPC calls
-31. workerPool.Stop()                       — drains queued jobs; waits for in-flight
+31. workerPool.Stop()                       — drains queued jobs; waits for in-flight; returns drained count
 32. [defer] mongoClient.Disconnect(context.Background()) — MongoDB connections released
 33. [defer] pool.Close()                    — Postgres connections released; process exits 0
 ```
@@ -414,27 +430,47 @@ Step 1: OS SIGINT/SIGTERM received
         → signal.NotifyContext cancels root ctx
         → poller.Run(ctx) exits select loop immediately — no more polls
         Reason: poller exits first so no new jobs are submitted after shutdown begins
+        Note: the worker pool's job ctx is derived with context.WithoutCancel and is
+              NOT cancelled here — see Step 3
 
 Step 2: server.Start detects <-ctx.Done()
-        → calls e.Shutdown(shutdownCtx) with 10-second timeout
-        → Echo stops accepting new connections; drains in-flight HTTP handlers
-        → server.Start returns
+        → calls srv.Shutdown(shutdownCtx) with 10-second timeout
+        → srv is the explicit *http.Server that owns the listener (it carries the
+          Read/Write/Idle timeouts Echo's e.Start cannot set). e.Server was never
+          started, so e.Shutdown would drain an unbound server and return instantly
+        → stops accepting new connections; drains in-flight HTTP handlers
+        → server.Start returns; a drain that exceeds the timeout returns a wrapped error
         Reason: drain HTTP first so handlers can still call service/DB while pool is live
 
+Step 2b: [if cfg.GRPCEnabled] grpcSrv.GracefulStop()
+        → waits for in-flight unary calls before refusing new ones
+
 Step 3: workerPool.Stop() called in main()
-        → close(pool.jobs) signals workers to finish after current job
+        → close(pool.jobs); workers range over the channel, so every job already
+          queued runs — queued work is drained, not discarded
         → p.wg.Wait() blocks until all goroutines finish
-        → in-flight outbox delivery jobs complete (with cancelled ctx passed to Publish)
+        → jobs run on drainCtx = WithTimeout(WithoutCancel(ctx), WORKER_DRAIN_TIMEOUT),
+          i.e. a live context: an outbox delivery drained here can still publish to
+          Kafka and mark the message processed
+        → Stop returns the drained job count, logged as "worker pool drained"
         Reason: outbox jobs must finish before DB connections are released
 
-Step 4: defer pool.Close() executes
-        → pgxpool releases all Postgres connections
-        Reason: last because steps 2–3 may still issue DB queries
+Step 4: telemetry flush, then metrics server shutdown
+        → telProv.Shutdown(5s) exports pending spans, including DB child spans
+        Reason: must run while the pgx pool is still open
 
-Step 5: process exits 0
+Step 5: defer mongoClient.Disconnect() and defer pool.Close() execute
+        → MongoDB and pgxpool connections released
+        Reason: last because steps 2–4 may still issue queries
+
+Step 6: process exits 0
         Note: SQLite db.Close() is not called explicitly in main — the OS closes the
         file descriptor on exit. Add explicit Close if crash-safety is required.
 ```
+
+**WORKER_DRAIN_TIMEOUT must exceed the 10s HTTP drain.** A job submitted by the very
+last HTTP request is queued while Step 2 is still draining; a shorter drain budget
+would expire before that job ever reaches a worker.
 
 ---
 

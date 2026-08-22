@@ -17,6 +17,9 @@ func (s *Service) Register(ctx context.Context, cmd RegisterCmd) (uuid.UUID, err
 }
 ```
 
+(This is illustrative — `customer.Repository` deliberately has no non-transactional
+`Save`, precisely so this shape cannot be written.)
+
 **The problem**: between step 1 and step 2 the process can die. The DB was updated. The event was never delivered. The consumer will never know the customer exists.
 
 ```
@@ -129,28 +132,35 @@ run goroutine:      executes job    (pool "stopped" but work is still happening)
 ### The Worker Loop
 
 ```go
-func (p *Pool) run(ctx context.Context) {
+func (p *Pool) run(jobCtx context.Context) {
     defer p.wg.Done()
-    for {
-        select {
-        case job, ok := <-p.jobs:
-            if !ok {
-                return // channel closed — Stop() was called
-            }
-            if err := job(ctx); err != nil {
-                p.logger.ErrorContext(ctx, "worker job failed", slog.Any("error", err))
-                // error logged, worker continues — not propagated
-            }
-        case <-ctx.Done():
-            return // context cancelled — graceful shutdown
+    for job := range p.jobs {
+        if err := job(jobCtx); err != nil {
+            p.logger.ErrorContext(jobCtx, "worker job failed", slog.Any("error", err))
+            // error logged, worker continues — not propagated
         }
+        p.executed.Add(1)
     }
 }
 ```
 
-The `select` has two exit conditions:
-- `!ok` on the channel: `Stop()` closed it. Worker exits the loop.
-- `ctx.Done()`: the root context was cancelled (OS signal). Worker stops accepting new jobs.
+There is exactly one exit condition: `Stop()` closes the channel, `range` drains what
+is left, and the worker returns. There is deliberately **no** `case <-ctx.Done()` — a
+worker that exits on cancellation abandons whatever is still queued, which is precisely
+the guarantee `Stop` makes. The cost is that `Stop` is mandatory: a pool that is never
+stopped leaks its goroutines.
+
+**`jobCtx` is not the lifecycle context.** It is handed to every job and must outlive
+the shutdown signal, otherwise every drained job fails at its first network or database
+call. `main.go` derives it once:
+
+```go
+drainCtx, cancelDrain := context.WithTimeout(
+    context.WithoutCancel(ctx), cfg.WorkerDrainTimeout,
+)
+defer cancelDrain()
+workerPool := worker.New(drainCtx, cfg.WorkerCount, cfg.WorkerQueue, logger)
+```
 
 **A job that returns an error does not kill the worker.** The pool logs and continues — critical for the outbox: one failing message must not stop delivery of others.
 
@@ -258,7 +268,7 @@ Interfaces at the consumer. `Service` only needs to open transactions — it doe
 
 type OutboxStore interface {
     SaveTx(ctx context.Context, tx pgx.Tx, msg OutboxMessage) error
-    FetchUnprocessed(ctx context.Context, limit int) ([]OutboxMessage, error)
+    ClaimBatch(ctx context.Context, limit int, reclaimAfter time.Duration) ([]OutboxMessage, error)
     MarkProcessed(ctx context.Context, id uuid.UUID) error
     MarkFailed(ctx context.Context, id uuid.UUID, reason string) error
 }
@@ -266,33 +276,51 @@ type OutboxStore interface {
 
 `SaveTx` is the most important method. It **requires** a live `pgx.Tx` — it never opens its own transaction. This design guarantees that anyone calling `SaveTx` understands they are participating in an existing transaction. There is no way to call `SaveTx` "outside" a transaction without passing a nil `pgx.Tx`, which would panic on the first query.
 
-### `FOR UPDATE SKIP LOCKED` — Contention-Free Locking
+### `ClaimBatch` — Contention-Free Locking in One Statement
 
 ```go
 // internal/outbox/postgres.go
 
-func (s *PostgresOutboxStore) FetchUnprocessed(ctx context.Context, limit int) ([]OutboxMessage, error) {
+func (s *PostgresOutboxStore) ClaimBatch(ctx context.Context, limit int, reclaimAfter time.Duration) ([]OutboxMessage, error) {
     rows, err := s.pool.Query(ctx, `
-        SELECT id, aggregate_id, event_type, payload, created_at, attempts, last_error
-        FROM outbox_messages
-        WHERE processed_at IS NULL
-        ORDER BY created_at
-        LIMIT $1
-        FOR UPDATE SKIP LOCKED   -- ← critical for multi-replica deployments
-    `, limit)
+        UPDATE outbox_messages
+        SET locked_at = now()
+        WHERE id IN (
+            SELECT id FROM outbox_messages
+            WHERE processed_at IS NULL
+              AND (locked_at IS NULL OR locked_at < now() - $2::interval)
+            ORDER BY created_at
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED   -- ← critical for multi-replica deployments
+        )
+        RETURNING id, aggregate_id, event_type, payload, created_at, attempts, last_error
+    `, limit, reclaimAfter)
     // ...
 }
 ```
 
 `FOR UPDATE` locks the selected rows. `SKIP LOCKED` skips rows already locked by another transaction.
 
-**Why does this matter?** In a multi-replica deployment, two pollers could select the same messages and deliver them twice. `SKIP LOCKED` solves this: each poller only sees rows no other poller is currently processing. No application-level mutex, no distributed coordination — Postgres does the work.
+**Why the `UPDATE` wrapper matters.** A bare `SELECT ... FOR UPDATE SKIP LOCKED` issued
+through `pool.Query` runs in an implicit single-statement transaction: the locks are
+released the moment the rows are returned, so a second poller polling a millisecond later
+sees the same rows unlocked and claims them too. Folding the selection and the `locked_at`
+write into one statement is what makes the exclusion hold — the `UPDATE`'s own transaction
+holds the locks through the write.
 
 ```
-Replica A: SELECT ... FOR UPDATE SKIP LOCKED → gets messages [1, 2, 3]
-Replica B: SELECT ... FOR UPDATE SKIP LOCKED → gets messages [4, 5, 6]
+Replica A: ClaimBatch → gets messages [1, 2, 3], locked_at = now()
+Replica B: ClaimBatch → gets messages [4, 5, 6]
            (messages 1–3 are locked, so they are skipped)
 ```
+
+**Reclaiming abandoned locks.** A poller that dies between claiming and marking would
+strand its batch forever. `locked_at < now() - reclaimAfter` (5 minutes, `_reclaimAfter`
+in `poller.go`) makes such a row claimable again. The window must exceed the worst-case
+publish latency so a slow Kafka write is not reclaimed under the poller that owns it.
+
+`MarkFailed` clears `locked_at` as well as recording the error, so a failed message is
+retried on the very next tick instead of waiting out the reclaim window.
 
 ### The `Publisher` Interface
 
@@ -355,7 +383,7 @@ The poller runs in a separate goroutine launched in `main.go`. It stops when `ct
 
 ```go
 func (p *Poller) poll(ctx context.Context) {
-    msgs, err := p.store.FetchUnprocessed(ctx, p.batchSize)
+    msgs, err := p.store.ClaimBatch(ctx, p.batchSize, _reclaimAfter)
     if err != nil {
         p.logger.ErrorContext(ctx, "outbox poll failed", slog.Any("error", err))
         return
@@ -382,7 +410,7 @@ func (p *Poller) deliver(ctx context.Context, msg OutboxMessage) error {
 }
 ```
 
-**What happens when the pool is full**: the poller abandons the remaining batch and returns. On the next tick, `FetchUnprocessed` will return the same messages again (still `processed_at IS NULL`). No message is lost — just delayed.
+**What happens when the pool is full**: the poller abandons the remaining batch and returns. Those messages stay claimed until the reclaim window elapses, then become claimable again. No message is lost — just delayed.
 
 ---
 
@@ -431,9 +459,14 @@ workerPool.Stop()
 // Step 5: Postgres closes via defer pool.Close()
 ```
 
-**Why doesn't the pool rely solely on `ctx` to stop?**
+**Why doesn't the pool stop on `ctx` at all?**
 
-It does use it — workers have `case <-ctx.Done()` in the select. But `Stop()` also closes the channel, which drains the queue before stopping. This guarantees that jobs already enqueued complete even after context cancellation. The combination of both mechanisms is what makes the shutdown truly graceful.
+Because stopping on cancellation and draining the queue are mutually exclusive. If a
+worker returns on `ctx.Done()`, whatever is still buffered in the channel is discarded —
+and at shutdown the buffer is exactly where the work that has not run yet lives. `Stop()`
+closing the channel is the only exit path, so every queued job runs. The bound on how
+long that may take is `WORKER_DRAIN_TIMEOUT` on the job context, not a cancellation of
+the loop.
 
 ---
 
@@ -445,7 +478,8 @@ It does use it — workers have `case <-ctx.Done()` in the select. But `Stop()` 
 | Process dies after `COMMIT`, before poller delivers | After successful write | Message stays in `outbox_messages` with `processed_at NULL` | Next process start + poller delivers |
 | Publisher fails delivery | During `poller.deliver` | `attempts++`, `last_error` updated | Next tick retries |
 | Worker pool is full | During `poller.poll` | Current batch abandoned | Next tick fetches again |
-| Postgres unreachable | During `FetchUnprocessed` | Error logged, tick skipped | Next tick retries |
+| Poller dies after claiming, before marking | Between `ClaimBatch` and `MarkProcessed` | Rows stay `locked_at` set, `processed_at NULL` | Another poller reclaims after the 5m window |
+| Postgres unreachable | During `ClaimBatch` | Error logged, tick skipped | Next tick retries |
 
 **At-least-once delivery**: a message may be delivered more than once if the process dies between `Publish` and `MarkProcessed`. Consumers must be idempotent (processing the same message twice has no duplicate side effects).
 
