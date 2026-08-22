@@ -180,7 +180,7 @@ func TestService_Register(t *testing.T) {
 			},
 			setup: func(r *mockRepo) {
 				existing, _ := customer.New("Existing", "existing@example.com", yesterday)
-				_ = r.Save(context.Background(), existing)
+				r.seed(existing)
 			},
 			wantErr: customer.ErrEmailExists,
 		},
@@ -229,7 +229,7 @@ func TestService_Remove(t *testing.T) {
 
 		repo := newMockRepo()
 		c, _ := customer.New("Alice", "alice@example.com", yesterday)
-		_ = repo.Save(context.Background(), c)
+		repo.seed(c)
 
 		svc := newTestService(repo)
 		err := svc.Remove(context.Background(), c.ID)
@@ -269,7 +269,7 @@ func (n *noopOutboxStore) SaveTx(_ context.Context, _ pgx.Tx, _ outbox.OutboxMes
 func (n *noopOutboxStore) FetchUnprocessed(_ context.Context, _ int) ([]outbox.OutboxMessage, error) {
 	return nil, nil
 }
-func (n *noopOutboxStore) MarkProcessed(_ context.Context, _ uuid.UUID) error { return nil }
+func (n *noopOutboxStore) MarkProcessed(_ context.Context, _ uuid.UUID) error        { return nil }
 func (n *noopOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error { return nil }
 
 // stubTx is a no-op pgx.Tx for unit tests that do not touch a real database.
@@ -302,23 +302,25 @@ func newMockRepo() *mockRepo {
 	}
 }
 
-func (m *mockRepo) Save(_ context.Context, c customer.Customer) error {
+// seed puts a customer in the mock without going through the service.
+// It is a test fixture, not part of customer.Repository — the interface has no
+// non-transactional write.
+func (m *mockRepo) seed(c customer.Customer) {
 	m.customers[c.ID] = c
 	m.byEmail[c.Email] = c
-	return nil
 }
 
 func (m *mockRepo) SaveTx(_ context.Context, _ pgx.Tx, c customer.Customer) error {
-	return m.Save(context.Background(), c)
-}
-
-func (m *mockRepo) Update(_ context.Context, c customer.Customer) error {
-	m.customers[c.ID] = c
-	m.byEmail[c.Email] = c
+	m.seed(c)
 	return nil
 }
 
-func (m *mockRepo) Delete(_ context.Context, id uuid.UUID) error {
+func (m *mockRepo) UpdateTx(_ context.Context, _ pgx.Tx, c customer.Customer) error {
+	m.seed(c)
+	return nil
+}
+
+func (m *mockRepo) DeleteTx(_ context.Context, _ pgx.Tx, id uuid.UUID) error {
 	c, ok := m.customers[id]
 	if !ok {
 		return customer.ErrNotFound

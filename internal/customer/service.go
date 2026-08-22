@@ -175,6 +175,8 @@ func (s *Service) Update(ctx context.Context, cmd UpdateCmd) error {
 		return err
 	}
 
+	// The customer write and the outbox message share one transaction, exactly
+	// as in Register: an update that cannot record its event must not commit.
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		err = fmt.Errorf("customer.Service.Update: begin tx: %w", err)
@@ -184,7 +186,7 @@ func (s *Service) Update(ctx context.Context, cmd UpdateCmd) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if err := s.repo.Update(ctx, c); err != nil {
+	if err := s.repo.UpdateTx(ctx, tx, c); err != nil {
 		err = fmt.Errorf("customer.Service.Update: save: %w", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -230,6 +232,7 @@ func (s *Service) Remove(ctx context.Context, id uuid.UUID) error {
 		return err
 	}
 
+	// Delete and the outbox message share one transaction — see Update.
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		err = fmt.Errorf("customer.Service.Remove: begin tx: %w", err)
@@ -239,7 +242,7 @@ func (s *Service) Remove(ctx context.Context, id uuid.UUID) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if err := s.repo.Delete(ctx, id); err != nil {
+	if err := s.repo.DeleteTx(ctx, tx, id); err != nil {
 		err = fmt.Errorf("customer.Service.Remove: delete: %w", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())

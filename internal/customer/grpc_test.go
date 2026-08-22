@@ -116,7 +116,7 @@ func TestGRPCHandler_GetCustomer(t *testing.T) {
 	repo := newMockRepo()
 	c, err := customer.New("Alice", "alice@example.com", time.Now().AddDate(-1, 0, 0))
 	require.NoError(t, err)
-	require.NoError(t, repo.Save(context.Background(), c))
+	repo.seed(c)
 
 	client := newTestGRPCClient(t, newGRPCHandler(repo))
 
@@ -147,7 +147,7 @@ func TestGRPCHandler_ListCustomers(t *testing.T) {
 	for _, name := range []string{"Alice", "Bob"} {
 		c, err := customer.New(name, name+"@example.com", time.Now().AddDate(-1, 0, 0))
 		require.NoError(t, err)
-		require.NoError(t, repo.Save(context.Background(), c))
+		repo.seed(c)
 	}
 
 	client := newTestGRPCClient(t, newGRPCHandler(repo))
@@ -163,7 +163,7 @@ func TestGRPCHandler_UpdateCustomer(t *testing.T) {
 	repo := newMockRepo()
 	c, err := customer.New("Alice", "alice@example.com", time.Now().AddDate(-1, 0, 0))
 	require.NoError(t, err)
-	require.NoError(t, repo.Save(context.Background(), c))
+	repo.seed(c)
 
 	client := newTestGRPCClient(t, newGRPCHandler(repo))
 
@@ -189,7 +189,7 @@ func TestGRPCHandler_RemoveCustomer(t *testing.T) {
 	repo := newMockRepo()
 	c, err := customer.New("Alice", "alice@example.com", time.Now().AddDate(-1, 0, 0))
 	require.NoError(t, err)
-	require.NoError(t, repo.Save(context.Background(), c))
+	repo.seed(c)
 
 	client := newTestGRPCClient(t, newGRPCHandler(repo))
 
