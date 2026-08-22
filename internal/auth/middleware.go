@@ -3,6 +3,7 @@ package auth
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/labstack/echo/v4"
@@ -46,11 +47,17 @@ func JWTMiddleware(secret string) echo.MiddlewareFunc {
 	}
 }
 
+// extractBearerToken returns the token from an Authorization header, or "" if
+// the header is absent or does not use the Bearer scheme.
+//
+// CutPrefix, not a length check and a slice: the old form accepted any header
+// at least as long as "Bearer " and cut seven bytes off it, so "Token abcdefgh"
+// arrived at the JWT parser as "abcdefgh" — a non-Bearer scheme treated as a
+// malformed token rather than as no credentials at all.
 func extractBearerToken(r *http.Request) string {
-	const prefix = "Bearer "
-	header := r.Header.Get("Authorization")
-	if len(header) < len(prefix) {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
 		return ""
 	}
-	return header[len(prefix):]
+	return token
 }
