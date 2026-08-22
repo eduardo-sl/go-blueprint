@@ -122,7 +122,16 @@ func main() {
 	}
 
 	// Step 1 of graceful shutdown: worker pool — started first, stopped last.
-	workerPool := worker.New(ctx, cfg.WorkerCount, cfg.WorkerQueue, logger)
+	//
+	// Jobs must outlive the signal: a drained outbox delivery still needs
+	// Postgres and Kafka. WithoutCancel detaches the job context from the
+	// signal context; the timeout re-bounds it so a wedged job cannot hold
+	// shutdown open forever.
+	drainCtx, cancelDrain := context.WithTimeout(
+		context.WithoutCancel(ctx), cfg.WorkerDrainTimeout,
+	)
+	defer cancelDrain()
+	workerPool := worker.New(drainCtx, cfg.WorkerCount, cfg.WorkerQueue, logger)
 
 	// Outbox store and publisher.
 	// Default publisher is LogPublisher (dev/test). Replaced by KafkaProducer when enabled.
@@ -251,8 +260,8 @@ func main() {
 
 	// Step 3: worker pool drains queued jobs and waits for in-flight deliveries.
 	// The outbox poller already exited because ctx was cancelled before this point.
-	workerPool.Stop()
-	logger.Info("worker pool drained")
+	drained := workerPool.Stop()
+	logger.Info("worker pool drained", slog.Int("jobs", drained))
 
 	// Step 4: flush OTel spans and metrics before closing the database pool.
 	// Pending spans include DB child spans — the tracer provider must still be
