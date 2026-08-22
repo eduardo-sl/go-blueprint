@@ -134,7 +134,14 @@ func extractToken(ctx context.Context) (string, error) {
 	if len(values) == 0 {
 		return "", status.Error(codes.Unauthenticated, "missing authorization")
 	}
-	return strings.TrimPrefix(values[0], "Bearer "), nil
+	// CutPrefix, not TrimPrefix: TrimPrefix returns the input untouched when the
+	// prefix is absent, so a "Basic ..." credential was forwarded verbatim to the
+	// JWT parser instead of being rejected as the wrong scheme.
+	token, ok := strings.CutPrefix(values[0], "Bearer ")
+	if !ok {
+		return "", status.Error(codes.Unauthenticated, "missing authorization")
+	}
+	return token, nil
 }
 
 // wrappedStream overrides the context on a grpc.ServerStream.
