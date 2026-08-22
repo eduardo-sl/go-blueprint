@@ -36,20 +36,22 @@ func (s *PostgresOutboxStore) SaveTx(ctx context.Context, tx pgx.Tx, msg OutboxM
 // the write, so a concurrent poller cannot select the same ids. Reading via
 // pool.Query on a bare SELECT ... FOR UPDATE releases the locks as soon as the
 // rows are returned, which is the defect this replaces.
-func (s *PostgresOutboxStore) ClaimBatch(ctx context.Context, limit int, reclaimAfter time.Duration) ([]OutboxMessage, error) {
+func (s *PostgresOutboxStore) ClaimBatch(ctx context.Context, limit int, reclaimAfter time.Duration, maxAttempts int) ([]OutboxMessage, error) {
 	rows, err := s.pool.Query(ctx, `
 		UPDATE outbox_messages
 		SET locked_at = now()
 		WHERE id IN (
 			SELECT id FROM outbox_messages
 			WHERE processed_at IS NULL
+			  AND attempts < $3
+			  AND next_attempt_at <= now()
 			  AND (locked_at IS NULL OR locked_at < now() - $2::interval)
 			ORDER BY created_at
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		)
 		RETURNING id, aggregate_id, event_type, payload, created_at, attempts, last_error
-	`, limit, reclaimAfter)
+	`, limit, reclaimAfter, maxAttempts)
 	if err != nil {
 		return nil, fmt.Errorf("outbox.ClaimBatch: %w", err)
 	}
@@ -90,17 +92,38 @@ func (s *PostgresOutboxStore) MarkProcessed(ctx context.Context, id uuid.UUID) e
 	return nil
 }
 
-func (s *PostgresOutboxStore) MarkFailed(ctx context.Context, id uuid.UUID, reason string) error {
+func (s *PostgresOutboxStore) MarkFailed(ctx context.Context, id uuid.UUID, reason string, retryAfter time.Duration) error {
 	// Clearing locked_at is what makes the retry happen: without it the message
-	// stays claimed for the full reclaim window instead of being picked up on
-	// the next tick.
+	// stays claimed for the full reclaim window. next_attempt_at is what keeps
+	// the retry from happening immediately.
 	_, err := s.pool.Exec(ctx, `
 		UPDATE outbox_messages
-		SET attempts = attempts + 1, last_error = $1, locked_at = NULL
+		SET attempts = attempts + 1,
+		    last_error = $1,
+		    locked_at = NULL,
+		    next_attempt_at = now() + $3::interval
+		WHERE id = $2
+	`, reason, id, retryAfter)
+	if err != nil {
+		return fmt.Errorf("outbox.MarkFailed: %w", err)
+	}
+	return nil
+}
+
+// MarkExhausted sets processed_at purely to take the row out of the claim
+// query — the message was never delivered. attempts and last_error are left
+// in place so the row still explains why delivery was abandoned.
+func (s *PostgresOutboxStore) MarkExhausted(ctx context.Context, id uuid.UUID, reason string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE outbox_messages
+		SET attempts = attempts + 1,
+		    last_error = $1,
+		    locked_at = NULL,
+		    processed_at = now()
 		WHERE id = $2
 	`, reason, id)
 	if err != nil {
-		return fmt.Errorf("outbox.MarkFailed: %w", err)
+		return fmt.Errorf("outbox.MarkExhausted: %w", err)
 	}
 	return nil
 }

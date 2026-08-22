@@ -26,6 +26,7 @@ import (
 // single-statement transaction released the locks as soon as the rows came
 // back, so two pollers claimed the same messages.
 
+// _maxAttempts is declared in poller_test.go, which compiles under this tag too.
 const _reclaimWindow = 5 * time.Minute
 
 func newTestPool(t *testing.T) *pgxpool.Pool {
@@ -119,7 +120,7 @@ func TestPostgresOutboxStore_ConcurrentClaim(t *testing.T) {
 	for _, s := range []outbox.OutboxStore{storeA, storeB} {
 		go func() {
 			<-start
-			msgs, err := s.ClaimBatch(ctx, total, _reclaimWindow)
+			msgs, err := s.ClaimBatch(ctx, total, _reclaimWindow, _maxAttempts)
 			results <- claim{msgs: msgs, err: err}
 		}()
 	}
@@ -146,13 +147,13 @@ func TestPostgresOutboxStore_AbandonedLockReclaimed(t *testing.T) {
 
 	ids := seedMessages(t, pool, store, 1)
 
-	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow)
+	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)
 	require.Equal(t, ids[0], claimed[0].ID)
 
 	// A live lock is not reclaimable.
-	again, err := store.ClaimBatch(ctx, 1, _reclaimWindow)
+	again, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
 	require.NoError(t, err)
 	assert.Empty(t, again, "a message claimed moments ago must not be re-claimed")
 
@@ -162,7 +163,7 @@ func TestPostgresOutboxStore_AbandonedLockReclaimed(t *testing.T) {
 		ids[0])
 	require.NoError(t, err)
 
-	reclaimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow)
+	reclaimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
 	require.NoError(t, err)
 	require.Len(t, reclaimed, 1, "an abandoned lock must become claimable again")
 	assert.Equal(t, ids[0], reclaimed[0].ID)
@@ -175,14 +176,14 @@ func TestPostgresOutboxStore_MarkFailedReleasesClaim(t *testing.T) {
 
 	ids := seedMessages(t, pool, store, 1)
 
-	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow)
+	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)
 
-	require.NoError(t, store.MarkFailed(ctx, ids[0], "downstream unavailable"))
+	require.NoError(t, store.MarkFailed(ctx, ids[0], "downstream unavailable", 0))
 
 	// No waiting for the reclaim window: MarkFailed clears locked_at.
-	retry, err := store.ClaimBatch(ctx, 1, _reclaimWindow)
+	retry, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
 	require.NoError(t, err)
 	require.Len(t, retry, 1, "a failed message must be retried on the next tick")
 	assert.Equal(t, ids[0], retry[0].ID)
@@ -198,7 +199,7 @@ func TestPostgresOutboxStore_MarkProcessedRemovesFromClaims(t *testing.T) {
 
 	ids := seedMessages(t, pool, store, 1)
 
-	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow)
+	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)
 
@@ -209,7 +210,7 @@ func TestPostgresOutboxStore_MarkProcessedRemovesFromClaims(t *testing.T) {
 		ids[0])
 	require.NoError(t, err)
 
-	after, err := store.ClaimBatch(ctx, 1, _reclaimWindow)
+	after, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
 	require.NoError(t, err)
 	assert.Empty(t, after, "a processed message must never be claimed again")
 }
