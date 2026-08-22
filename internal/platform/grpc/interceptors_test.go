@@ -9,8 +9,8 @@ import (
 	customerv1 "github.com/eduardo-sl/go-blueprint/gen/customer/v1"
 	"github.com/eduardo-sl/go-blueprint/internal/auth"
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
-	grpcserver "github.com/eduardo-sl/go-blueprint/internal/platform/grpc"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
+	grpcserver "github.com/eduardo-sl/go-blueprint/internal/platform/grpc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -19,8 +19,8 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
-	"log/slog"
 	"io"
+	"log/slog"
 )
 
 const _bufSize = 1024 * 1024
