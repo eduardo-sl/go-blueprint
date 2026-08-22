@@ -1,6 +1,7 @@
 package outbox_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -20,7 +21,30 @@ import (
 // _maxAttempts is the delivery ceiling these tests poll under.
 const _maxAttempts = 5
 
+// _pollInterval doubles as the backoff base, so the expected schedules below
+// are all multiples of it.
+const _pollInterval = 1 * time.Millisecond
+
 func nopLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// safeBuffer collects log output. Delivery runs on a worker goroutine, so the
+// buffer is written from a goroutine other than the one asserting on it.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // ---- test doubles ----
 
@@ -119,7 +143,31 @@ func (p *stubPublisher) Publish(_ context.Context, msg outbox.OutboxMessage) err
 }
 
 func newPoller(store outbox.OutboxStore, pub outbox.Publisher, pool *worker.Pool) *outbox.Poller {
-	return outbox.NewPoller(store, pub, pool, 1*time.Millisecond, 50, _maxAttempts, nopLogger())
+	return outbox.NewPoller(store, pub, pool, _pollInterval, 50, _maxAttempts, nopLogger())
+}
+
+// runPoller runs p until ctx expires and drains the worker pool, so every
+// deliver job has finished before the caller asserts.
+func runPoller(ctx context.Context, p *outbox.Poller, pool *worker.Pool) {
+	done := make(chan struct{})
+	go func() {
+		p.Run(ctx)
+		close(done)
+	}()
+	<-ctx.Done()
+	<-done
+	pool.Stop()
+}
+
+func failingMsg(attempts int) outbox.OutboxMessage {
+	return outbox.OutboxMessage{
+		ID:          uuid.New(),
+		AggregateID: uuid.New(),
+		EventType:   "CustomerRegistered",
+		Payload:     []byte(`{}`),
+		CreatedAt:   time.Now(),
+		Attempts:    attempts,
+	}
 }
 
 // ---- tests ----
@@ -262,4 +310,99 @@ func TestPoller_EmptyOutbox_NoMarkCalls(t *testing.T) {
 	assert.Empty(t, store.processedIDs)
 	assert.Empty(t, store.failedIDs)
 	store.mu.Unlock()
+}
+
+// TestPoller_FailureSchedulesBackoff pins the retry schedule: the delay doubles
+// with each recorded attempt and stops growing at five minutes, so an outage
+// spaces retries out instead of letting the poller spin on them.
+func TestPoller_FailureSchedulesBackoff(t *testing.T) {
+	tests := []struct {
+		name           string
+		attempts       int
+		wantRetryAfter time.Duration
+	}{
+		{name: "first failure", attempts: 0, wantRetryAfter: 2 * _pollInterval},
+		{name: "second failure", attempts: 1, wantRetryAfter: 4 * _pollInterval},
+		{name: "fourth failure", attempts: 3, wantRetryAfter: 16 * _pollInterval},
+		{name: "capped, not overflowed", attempts: 20, wantRetryAfter: 5 * time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			msg := failingMsg(tt.attempts)
+			store := newStubStore(msg)
+			pub := &stubPublisher{err: errors.New("downstream unavailable")}
+			pool := worker.New(ctx, 2, 10, nopLogger())
+
+			// A ceiling far above tt.attempts keeps every case on the retry
+			// path; exhaustion is covered separately below.
+			poller := outbox.NewPoller(store, pub, pool, _pollInterval, 50, 1_000, nopLogger())
+			pollCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer cancel()
+
+			runPoller(pollCtx, poller, pool)
+
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			require.Len(t, store.failedRetryAfter, 1)
+			assert.Equal(t, tt.wantRetryAfter, store.failedRetryAfter[0])
+			assert.Empty(t, store.exhaustedIDs)
+		})
+	}
+}
+
+// TestPoller_ExhaustedRetries_Terminal covers the one place a message stops
+// being retried: the last attempt must retire the row rather than reschedule
+// it, and must say so at error level.
+func TestPoller_ExhaustedRetries_Terminal(t *testing.T) {
+	ctx := context.Background()
+
+	msg := failingMsg(_maxAttempts - 1)
+	store := newStubStore(msg)
+	pub := &stubPublisher{err: errors.New("downstream unavailable")}
+	pool := worker.New(ctx, 2, 10, nopLogger())
+
+	logs := &safeBuffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	poller := outbox.NewPoller(store, pub, pool, _pollInterval, 50, _maxAttempts, logger)
+	pollCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+
+	runPoller(pollCtx, poller, pool)
+
+	store.mu.Lock()
+	require.Len(t, store.exhaustedIDs, 1)
+	assert.Equal(t, msg.ID, store.exhaustedIDs[0])
+	assert.Equal(t, "downstream unavailable", store.exhaustedReasons[0])
+	assert.Empty(t, store.failedIDs, "an exhausted message must not be rescheduled")
+	assert.Empty(t, store.processedIDs, "the message was never delivered")
+	store.mu.Unlock()
+
+	out := logs.String()
+	assert.Contains(t, out, "outbox message exhausted retries")
+	assert.Contains(t, out, msg.ID.String())
+}
+
+// TestPoller_ExhaustedMessageNotReclaimed guards the loop the attempt ceiling
+// exists to break: once retired, the message must not come back on a later tick.
+func TestPoller_ExhaustedMessageNotReclaimed(t *testing.T) {
+	ctx := context.Background()
+
+	msg := failingMsg(_maxAttempts - 1)
+	store := newStubStore(msg)
+	pub := &stubPublisher{err: errors.New("downstream unavailable")}
+	pool := worker.New(ctx, 2, 10, nopLogger())
+
+	poller := newPoller(store, pub, pool)
+	// Long enough for many ticks at a 1ms interval.
+	pollCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+
+	runPoller(pollCtx, poller, pool)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Len(t, store.exhaustedIDs, 1, "the message was delivered to the terminal path more than once")
 }
