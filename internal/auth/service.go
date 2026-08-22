@@ -82,6 +82,10 @@ type LoginCmd struct {
 // ValidateToken parses and verifies a JWT string, returning the claims on success.
 // It is used by the gRPC auth interceptor to share the same validation logic as the
 // HTTP middleware without duplicating the signing key or algorithm checks.
+//
+// A rejected token returns ErrInvalidToken, not ErrInvalidPassword: nothing about
+// a failed signature or an expiry says anything about a password, and reading a
+// log line that claims otherwise sends the reader looking in the wrong place.
 func (s *Service) ValidateToken(tokenStr string) (jwt.MapClaims, error) {
 	claims := jwt.MapClaims{}
 	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
@@ -91,7 +95,7 @@ func (s *Service) ValidateToken(tokenStr string) (jwt.MapClaims, error) {
 		return s.jwtSecret, nil
 	})
 	if err != nil || !token.Valid {
-		return nil, ErrInvalidPassword
+		return nil, ErrInvalidToken
 	}
 	return claims, nil
 }

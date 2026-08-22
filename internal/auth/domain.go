@@ -12,6 +12,7 @@ var (
 	ErrUserNotFound     = errors.New("user not found")
 	ErrEmailExists      = errors.New("email already registered")
 	ErrInvalidPassword  = errors.New("invalid password")
+	ErrInvalidToken     = errors.New("invalid or expired token")
 	ErrEmailRequired    = errors.New("email is required")
 	ErrNameRequired     = errors.New("name is required")
 	ErrPasswordTooShort = errors.New("password must be at least 8 characters")
