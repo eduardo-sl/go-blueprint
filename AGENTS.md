@@ -98,18 +98,25 @@ internal/customer/events.go                        — EventHandler: implements 
                                                      routes CustomerRegistered/Updated/Removed; unknown types skipped (return nil)
 internal/customer/service_tx_test.go               — Unit: Update/Remove write on the service tx; rollback pairs both writes
 internal/customer/customer_test.go                 — Unit: TestNew (table-driven), TestService_Register; hand-crafted stubs; no HTTP/DB
+internal/customer/handler_test.go                  — Unit (package customer): mapDomainError status + rendered body, table-driven
 internal/customer/integration_test.go              — //go:build integration; testcontainers-go real Postgres; full CRUD
 internal/customer/cached_query_test.go             — Unit: CachedQueryService hit/miss/corruption/invalidation
 internal/customer/cache_integration_test.go        — //go:build integration; real Redis via testcontainers
 
 internal/auth/domain.go                            — User struct; NewUser(); sentinel errors: ErrUserNotFound, ErrEmailExists,
-                                                     ErrInvalidPassword, ErrEmailRequired, ErrNameRequired, ErrPasswordTooShort
+                                                     ErrInvalidPassword, ErrInvalidToken, ErrEmailRequired, ErrNameRequired,
+                                                     ErrPasswordTooShort
 internal/auth/repository.go                        — Repository interface: Save, FindByEmail, FindByID
 internal/auth/service.go                           — Service: Register (bcrypt cost 12, min 8 chars), Login (verifies hash, issues JWT
-                                                     HS256 with sub/email/exp/iat); TokenResponse type
+                                                     HS256 with sub/email/exp/iat), ValidateToken (→ ErrInvalidToken);
+                                                     _dummyHash equalises the unknown-email login cost; TokenResponse type
 internal/auth/handler.go                           — Echo handlers /auth/register and /auth/login; mapAuthError(); RegisterRoutes()
 internal/auth/middleware.go                        — JWTMiddleware(secret) echo.MiddlewareFunc; sets "user_id" in echo.Context;
-                                                     extractBearerToken; ClaimsKey (typed context key for gRPC interceptor)
+                                                     extractBearerToken (strings.CutPrefix — a non-Bearer scheme is no credentials);
+                                                     ClaimsKey (typed context key for gRPC interceptor)
+
+internal/auth/auth_test.go                         — Unit: Authorization scheme table; ValidateToken sentinel; login timing parity
+internal/auth/export_test.go                       — SetBcryptCostForTest — test-only hook lowering the cost and the placeholder hash
 
 internal/eventlog/store.go                         — Event struct; Store interface: Append(ctx, Event) error;
                                                      FetchSince(ctx, aggregateID string, since time.Time) ([]Event, error)
@@ -185,30 +192,34 @@ internal/worker/pool_test.go                       — Unit: submit, drain, back
 internal/outbox/outbox.go                          — OutboxMessage struct (ID, AggregateID, EventType, Payload json.RawMessage,
                                                      CreatedAt, ProcessedAt *time.Time, Attempts, LastError *string);
                                                      Publisher interface (Publish)
-internal/outbox/store.go                           — OutboxStore interface: SaveTx(pgx.Tx), ClaimBatch(limit, reclaimAfter),
-                                                     MarkProcessed, MarkFailed
+internal/outbox/store.go                           — OutboxStore interface: SaveTx(pgx.Tx), ClaimBatch(limit, reclaimAfter, maxAttempts),
+                                                     MarkProcessed, MarkFailed(reason, retryAfter), MarkExhausted
 internal/outbox/postgres.go                        — PostgresOutboxStore: SaveTx inserts into outbox_messages;
                                                      ClaimBatch = one UPDATE ... (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING,
                                                      setting locked_at so concurrent pollers get disjoint batches;
-                                                     MarkProcessed sets processed_at; MarkFailed increments attempts and
-                                                     clears locked_at so the message retries next tick
-internal/outbox/poller.go                          — Poller: Run(ctx) ticker loop; _reclaimAfter = 5m; poll() claims a batch and
-                                                     submits each msg as worker.Job; returns early on ErrPoolFull (next tick retries);
-                                                     deliver() → Publish → MarkProcessed or MarkFailed
+                                                     claiming only rows under maxAttempts whose next_attempt_at has passed;
+                                                     MarkProcessed sets processed_at; MarkFailed increments attempts, clears
+                                                     locked_at and pushes next_attempt_at out; MarkExhausted retires the row
+internal/outbox/poller.go                          — Poller: Run(ctx) ticker loop; _reclaimAfter = 5m; _maxBackoff = 5m; poll() claims a
+                                                     batch and submits each msg as worker.Job; returns early on ErrPoolFull (next tick
+                                                     retries); deliver() → Publish → MarkProcessed, or MarkFailed(backoff(attempts))
+                                                     until maxAttempts, then MarkExhausted + error log
 internal/outbox/log_publisher.go                   — LogPublisher: logs event_type/aggregate_id/payload via slog; dev/test only
-internal/outbox/poller_test.go                     — Unit: poll/deliver logic
-internal/outbox/integration_test.go                — [integration] concurrent claim, abandoned-lock reclaim, MarkFailed release
+internal/outbox/poller_test.go                     — Unit: poll/deliver logic; backoff schedule; exhaustion is terminal
+internal/outbox/integration_test.go                — [integration] concurrent claim, abandoned-lock reclaim, MarkFailed release,
+                                                     attempt ceiling, backoff schedule, MarkExhausted terminal
 
 internal/platform/kafka/handler.go                 — Handler interface; HandlerFunc adapter; headerValue helper (pkg-private)
 internal/platform/kafka/producer.go                — Producer implements outbox.Publisher; kgo.StickyKeyPartitioner(AggregateID);
-                                                     SnappyCompression; AllISRAcks; retry loop → DLQWriter.Write on exhaustion
+                                                     SnappyCompression; AllISRAcks; RequestRetries(cfg) — one ProduceSync per Publish,
+                                                     failure → DLQWriter.Write
 internal/platform/kafka/consumer.go                — Consumer: ConsumerGroup + DisableAutoCommit + BlockRebalanceOnPoll;
                                                      Run: AllowRebalance() ALWAYS first after PollFetches (avoids deadlock);
                                                      batchFailed flag — offset NOT committed if any record fails
 internal/platform/kafka/dlq.go                     — DLQWriter: writes to dead letter topic with failure_reason+failed_at headers
 internal/platform/kafka/middleware.go              — Chain(); WithLogging(); WithRecovery() (panic→error); WithIdempotency() (sync.Map)
-internal/platform/kafka/kafka_test.go              — kfake tests: produce, DLQ write, consumer dispatch, error/no-commit, ctx cancel,
-                                                     idempotency, recovery, logging, chain order
+internal/platform/kafka/kafka_test.go              — kfake tests: produce, single produce attempt → DLQ, DLQ write, consumer dispatch,
+                                                     error/no-commit, ctx cancel, idempotency, recovery, logging, chain order
 
 migrations/001_create_customers.sql                — customers table; pgcrypto extension
 migrations/002_create_users.sql                    — users table
@@ -301,7 +312,10 @@ cmd/api/main.go                         [wiring only, no business logic]
 - **Postgres impl**: `internal/outbox/postgres.go` → `PostgresOutboxStore`; `ClaimBatch` is a single `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING ...` — the claim and the lock write must stay in one statement, otherwise the locks release when the rows are returned and two replicas claim the same messages
 - **Claim window**: `locked_at TIMESTAMPTZ` marks a claimed row; a lock older than `_reclaimAfter` (5m, `internal/outbox/poller.go`) is treated as abandoned and re-claimed, so a poller that dies mid-flight does not strand its batch
 - **Release on failure**: `MarkFailed` clears `locked_at` along with recording the error — without that the message stays claimed for the full reclaim window instead of retrying on the next tick
+- **Retry schedule**: `MarkFailed` also sets `next_attempt_at = now() + retryAfter`, where `retryAfter` is `Poller.backoff(attempts)` = `OUTBOX_INTERVAL * 2^attempts` capped at 5m. The schedule lives in the row, not in the poller, so a restart resumes it and `psql` shows why a message is not moving
+- **Attempt ceiling**: `ClaimBatch` filters `attempts < OUTBOX_MAX_ATTEMPTS`; at the ceiling `deliver` calls `MarkExhausted` (sets `processed_at`, keeps `attempts`/`last_error`) and logs `"outbox message exhausted retries"` at error level. This is the only place a message stops being retried, so a non-zero rate is alertable
 - **Poller**: `internal/outbox/poller.go` → `Poller.Run(ctx)` ticker; `poll()` calls `ClaimBatch` then submits each msg as `worker.Job`; stops batch on `ErrPoolFull` (next tick retries)
+- **Why the backoff is not a sleep in `deliver`**: each claimed message is an independent worker job, so sleeping would hold a worker slot for the whole delay and a broker outage would saturate a `WORKER_QUEUE` of 100 with sleeping jobs
 - **Publisher interface**: `internal/outbox/outbox.go` → `Publisher`
 - **Dev publisher**: `internal/outbox/log_publisher.go` → `LogPublisher` — logs and returns nil; replace with `KafkaPublisher` for production
 - **Atomicity — all three writes**: `Register`, `Update` and `Remove` in `internal/customer/service.go` each pair `repo.{Save,Update,Delete}Tx(ctx, tx, …)` with `outboxStore.SaveTx(ctx, tx, msg)` on the same `pgx.Tx`, then `tx.Commit()`. A write that cannot record its event does not commit.
@@ -326,8 +340,9 @@ cmd/api/main.go                         [wiring only, no business logic]
 ### Domain Error → HTTP Mapping
 
 - **Sentinel errors — customer**: `internal/customer/domain.go` → `ErrNotFound`→404, `ErrEmailExists`→409, `ErrInvalidBirthDate`→422
-- **Sentinel errors — auth**: `internal/auth/domain.go` → `ErrEmailExists`→409, `ErrInvalidPassword`→401, `ErrPasswordTooShort`→422
-- **Mapping**: `mapDomainError()` in `handler.go` of each package; `errors.Is()` switch → `echo.NewHTTPError(statusCode, err.Error())`
+- **Sentinel errors — auth**: `internal/auth/domain.go` → `ErrEmailExists`→409, `ErrInvalidPassword`→401, `ErrPasswordTooShort`→422; `ErrInvalidToken` is transport-level (401 from the middleware, `codes.Unauthenticated` from the interceptor)
+- **Mapping**: `mapDomainError()` in `handler.go` of each package; `errors.Is()` switch → `echo.NewHTTPError(statusCode, <sentinel>.Error())`
+- **The body is the sentinel's text, not `err.Error()`**: every layer wraps, so `err.Error()` would ship the internal call path (`customer.Service.Update: find customer: …`) to the client. The wrapped chain belongs in the log line at the handler boundary
 
 ### sqlc + Repository Adapter
 
@@ -359,6 +374,7 @@ cmd/api/main.go                         [wiring only, no business logic]
 | `WORKER_DRAIN_TIMEOUT` | `WorkerDrainTimeout` | `"15s"` | worker | No — upper bound on the post-signal drain; must exceed the 10s HTTP drain |
 | `OUTBOX_INTERVAL` | `OutboxInterval` | `5` | outbox | No (seconds between polls) |
 | `OUTBOX_BATCH` | `OutboxBatch` | `50` | outbox | No (max messages per poll) |
+| `OUTBOX_MAX_ATTEMPTS` | `OutboxMaxAttempts` | `5` | outbox | No — delivery attempts before DLQ + terminal |
 | `GRPC_ENABLED` | `GRPCEnabled` | `false` | grpc | No — `true` starts gRPC server alongside HTTP |
 | `GRPC_ADDR` | `GRPCAddr` | `":9090"` | grpc | No — gRPC listen address |
 | `MONGO_URI` | `MongoURI` | `"mongodb://localhost:27017"` | mongodb | No — MongoDB connection string |
@@ -376,7 +392,7 @@ Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) p
 | `users` | `id UUID PK`, `email TEXT UNIQUE`, `password_hash TEXT`, `name TEXT`, `created_at TIMESTAMPTZ` | `002_create_users.sql` | Auth domain |
 | `event_log` (Postgres) | `id TEXT PK`, `aggregate_id TEXT`, `event_type TEXT`, `payload JSONB`, `occurred_at TIMESTAMPTZ`; index on `aggregate_id` | `003_create_event_log.sql` | Schema only — runtime uses SQLite |
 | `event_log` (SQLite) | same columns, `payload TEXT`, `occurred_at DATETIME`; auto-migrated by `eventlog.NewSQLiteStore`; stored at `cfg.EventLogPath` (`./data/events.db`) | inline in `eventlog/sqlite.go` | EventLog (actual runtime) |
-| `outbox_messages` | `id UUID PK`, `aggregate_id UUID`, `event_type TEXT`, `payload JSONB`, `created_at TIMESTAMPTZ`, `processed_at TIMESTAMPTZ NULL`, `attempts INT DEFAULT 0`, `last_error TEXT NULL`, `locked_at TIMESTAMPTZ NULL`; partial index `idx_outbox_claimable` on `created_at WHERE processed_at IS NULL` | `004_create_outbox.sql`, `005_outbox_locking.sql` | Outbox |
+| `outbox_messages` | `id UUID PK`, `aggregate_id UUID`, `event_type TEXT`, `payload JSONB`, `created_at TIMESTAMPTZ`, `processed_at TIMESTAMPTZ NULL`, `attempts INT DEFAULT 0`, `last_error TEXT NULL`, `locked_at TIMESTAMPTZ NULL`, `next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()`; partial index `idx_outbox_claimable` on `created_at WHERE processed_at IS NULL` | `004_create_outbox.sql`, `005_outbox_locking.sql`, `006_outbox_backoff.sql` | Outbox |
 
 ---
 
