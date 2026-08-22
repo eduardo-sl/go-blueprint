@@ -13,24 +13,27 @@ import (
 )
 
 // Producer implements outbox.Publisher using Kafka.
-// Messages are sent with retries and exponential backoff.
-// On max retries exceeded, the message is forwarded to the DLQ.
+// Retries belong to the franz-go client, configured in NewProducer; a send the
+// client gives up on is forwarded to the DLQ.
 type Producer struct {
-	client  *kgo.Client
-	topic   string
-	dlq     *DLQWriter
-	retries int
-	logger  *slog.Logger
+	client *kgo.Client
+	topic  string
+	dlq    *DLQWriter
+	logger *slog.Logger
 }
 
 // NewProducer creates a Kafka producer.
 // Aggregate ID is used as the partition key to guarantee per-aggregate ordering.
+// retries bounds the client's own request retries; broker-level concerns —
+// leader election, metadata refresh — are what those retries exist to ride out,
+// and the application cannot see them.
 func NewProducer(brokers []string, topic string, dlq *DLQWriter, retries int, logger *slog.Logger) (*Producer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)),
 		kgo.ProducerBatchCompression(kgo.SnappyCompression()),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.RequestRetries(retries),
 		kgo.RetryBackoffFn(func(n int) time.Duration {
 			return time.Duration(math.Pow(2, float64(n))) * 100 * time.Millisecond
 		}),
@@ -39,17 +42,21 @@ func NewProducer(brokers []string, topic string, dlq *DLQWriter, retries int, lo
 		return nil, fmt.Errorf("kafka.NewProducer: %w", err)
 	}
 	return &Producer{
-		client:  client,
-		topic:   topic,
-		dlq:     dlq,
-		retries: retries,
-		logger:  logger,
+		client: client,
+		topic:  topic,
+		dlq:    dlq,
+		logger: logger,
 	}, nil
 }
 
 // Publish implements outbox.Publisher.
 // Uses AggregateID as the Kafka key to guarantee ordering per aggregate.
-// Retries up to p.retries times with exponential backoff; sends to DLQ on exhaustion.
+//
+// Exactly one ProduceSync call: retries are the client's job (RequestRetries and
+// RetryBackoffFn in NewProducer). A second loop here would nest one retry layer
+// inside another, making the worst-case latency the product of the two, and
+// only one of them would be documented. A send the client abandons goes to the
+// DLQ, and the outbox schedules its own retry from there.
 func (p *Producer) Publish(ctx context.Context, msg outbox.OutboxMessage) error {
 	record := &kgo.Record{
 		Topic: p.topic,
@@ -62,25 +69,14 @@ func (p *Producer) Publish(ctx context.Context, msg outbox.OutboxMessage) error 
 		},
 	}
 
-	var lastErr error
-	for attempt := 0; attempt <= p.retries; attempt++ {
-		if err := p.client.ProduceSync(ctx, record).FirstErr(); err != nil {
-			lastErr = err
-			p.logger.WarnContext(ctx, "kafka produce failed, retrying",
-				"attempt", attempt,
-				"message_id", msg.ID,
-				"error", err,
-			)
-			continue
-		}
-		return nil
+	if err := p.client.ProduceSync(ctx, record).FirstErr(); err != nil {
+		p.logger.ErrorContext(ctx, "kafka produce failed, sending to DLQ",
+			"message_id", msg.ID,
+			"error", err,
+		)
+		return p.dlq.Write(ctx, msg, err)
 	}
-
-	p.logger.ErrorContext(ctx, "kafka produce failed after retries, sending to DLQ",
-		"message_id", msg.ID,
-		"error", lastErr,
-	)
-	return p.dlq.Write(ctx, msg, lastErr)
+	return nil
 }
 
 // Close closes the underlying Kafka client.
