@@ -26,6 +26,7 @@ type Config struct {
 	WorkerDrainTimeout   time.Duration `mapstructure:"worker_drain_timeout"`
 	OutboxInterval       int           `mapstructure:"outbox_interval"` // seconds
 	OutboxBatch          int           `mapstructure:"outbox_batch"`
+	OutboxMaxAttempts    int           `mapstructure:"outbox_max_attempts"`
 	OTelEnabled          bool          `mapstructure:"otel_enabled"`
 	OTelServiceName      string        `mapstructure:"otel_service_name"`
 	OTelEndpoint         string        `mapstructure:"otel_endpoint"`
@@ -68,6 +69,7 @@ func Load() (*Config, error) {
 	v.SetDefault("worker_drain_timeout", "15s")
 	v.SetDefault("outbox_interval", 5)
 	v.SetDefault("outbox_batch", 50)
+	v.SetDefault("outbox_max_attempts", 5)
 	v.SetDefault("otel_enabled", false)
 	v.SetDefault("otel_service_name", "go-blueprint")
 	v.SetDefault("otel_endpoint", "localhost:4318")
