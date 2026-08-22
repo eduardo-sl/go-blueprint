@@ -10,6 +10,13 @@ import (
 	"github.com/eduardo-sl/go-blueprint/internal/worker"
 )
 
+// _reclaimAfter bounds how long a claimed message may stay locked before
+// another poller may take it over. It must exceed the worst-case publish
+// latency so a slow Kafka write is not reclaimed under the poller that owns it,
+// and stay short enough that a crashed poller's backlog recovers within one
+// deploy cycle.
+const _reclaimAfter = 5 * time.Minute
+
 // Poller polls the outbox table at a fixed interval and publishes
 // unprocessed messages via the configured Publisher.
 // It submits each delivery as a job to the worker pool for concurrent processing.
@@ -57,7 +64,9 @@ func (p *Poller) Run(ctx context.Context) {
 }
 
 func (p *Poller) poll(ctx context.Context) {
-	msgs, err := p.store.FetchUnprocessed(ctx, p.batchSize)
+	// ClaimBatch locks the rows it returns, so a second poller instance ticking
+	// at the same moment gets a disjoint batch.
+	msgs, err := p.store.ClaimBatch(ctx, p.batchSize, _reclaimAfter)
 	if err != nil {
 		p.logger.ErrorContext(ctx, "outbox poll failed", slog.Any("error", err))
 		return

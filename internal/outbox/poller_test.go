@@ -24,6 +24,7 @@ func nopLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, 
 type stubStore struct {
 	mu            sync.Mutex
 	msgs          []outbox.OutboxMessage
+	claimed       map[uuid.UUID]bool
 	processedIDs  []uuid.UUID
 	processedSet  map[uuid.UUID]bool
 	failedIDs     []uuid.UUID
@@ -31,7 +32,11 @@ type stubStore struct {
 }
 
 func newStubStore(msgs ...outbox.OutboxMessage) *stubStore {
-	return &stubStore{msgs: msgs, processedSet: map[uuid.UUID]bool{}}
+	return &stubStore{
+		msgs:         msgs,
+		claimed:      map[uuid.UUID]bool{},
+		processedSet: map[uuid.UUID]bool{},
+	}
 }
 
 func (s *stubStore) SaveTx(_ context.Context, _ pgx.Tx, msg outbox.OutboxMessage) error {
@@ -41,17 +46,22 @@ func (s *stubStore) SaveTx(_ context.Context, _ pgx.Tx, msg outbox.OutboxMessage
 	return nil
 }
 
-func (s *stubStore) FetchUnprocessed(_ context.Context, limit int) ([]outbox.OutboxMessage, error) {
+// ClaimBatch mirrors the real store: a message already claimed is not handed
+// out again until MarkFailed releases it.
+func (s *stubStore) ClaimBatch(_ context.Context, limit int, _ time.Duration) ([]outbox.OutboxMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var pending []outbox.OutboxMessage
 	for _, m := range s.msgs {
-		if !s.processedSet[m.ID] {
+		if !s.processedSet[m.ID] && !s.claimed[m.ID] {
 			pending = append(pending, m)
 		}
 	}
 	if len(pending) > limit {
 		pending = pending[:limit]
+	}
+	for _, m := range pending {
+		s.claimed[m.ID] = true
 	}
 	return pending, nil
 }
@@ -69,15 +79,16 @@ func (s *stubStore) MarkFailed(_ context.Context, id uuid.UUID, reason string) e
 	defer s.mu.Unlock()
 	s.failedIDs = append(s.failedIDs, id)
 	s.failedReasons = append(s.failedReasons, reason)
-	// mark as processed so subsequent ticks don't re-deliver
+	// The real store clears locked_at here so the next tick retries. This stub
+	// marks the message processed instead, to keep the failure count at one.
 	s.processedSet[id] = true
 	return nil
 }
 
 type stubPublisher struct {
-	mu       sync.Mutex
+	mu        sync.Mutex
 	published []outbox.OutboxMessage
-	err      error
+	err       error
 }
 
 func (p *stubPublisher) Publish(_ context.Context, msg outbox.OutboxMessage) error {

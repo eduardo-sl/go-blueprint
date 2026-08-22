@@ -31,20 +31,27 @@ func (s *PostgresOutboxStore) SaveTx(ctx context.Context, tx pgx.Tx, msg OutboxM
 	return nil
 }
 
-func (s *PostgresOutboxStore) FetchUnprocessed(ctx context.Context, limit int) ([]OutboxMessage, error) {
-	// FOR UPDATE SKIP LOCKED prevents two concurrent poller instances from
-	// picking up the same row. This is the standard Postgres advisory-lock
-	// pattern for polling queues — no application-level locking required.
+// ClaimBatch marks a batch of messages as locked and returns them in one
+// statement. The UPDATE's own transaction holds the SKIP LOCKED rows through
+// the write, so a concurrent poller cannot select the same ids. Reading via
+// pool.Query on a bare SELECT ... FOR UPDATE releases the locks as soon as the
+// rows are returned, which is the defect this replaces.
+func (s *PostgresOutboxStore) ClaimBatch(ctx context.Context, limit int, reclaimAfter time.Duration) ([]OutboxMessage, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, aggregate_id, event_type, payload, created_at, attempts, last_error
-		FROM outbox_messages
-		WHERE processed_at IS NULL
-		ORDER BY created_at
-		LIMIT $1
-		FOR UPDATE SKIP LOCKED
-	`, limit)
+		UPDATE outbox_messages
+		SET locked_at = now()
+		WHERE id IN (
+			SELECT id FROM outbox_messages
+			WHERE processed_at IS NULL
+			  AND (locked_at IS NULL OR locked_at < now() - $2::interval)
+			ORDER BY created_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, aggregate_id, event_type, payload, created_at, attempts, last_error
+	`, limit, reclaimAfter)
 	if err != nil {
-		return nil, fmt.Errorf("outbox.FetchUnprocessed: %w", err)
+		return nil, fmt.Errorf("outbox.ClaimBatch: %w", err)
 	}
 	defer rows.Close()
 
@@ -61,13 +68,13 @@ func (s *PostgresOutboxStore) FetchUnprocessed(ctx context.Context, limit int) (
 			&m.Attempts,
 			&lastError,
 		); err != nil {
-			return nil, fmt.Errorf("outbox.FetchUnprocessed: scan: %w", err)
+			return nil, fmt.Errorf("outbox.ClaimBatch: scan: %w", err)
 		}
 		m.LastError = lastError
 		msgs = append(msgs, m)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("outbox.FetchUnprocessed: rows: %w", err)
+		return nil, fmt.Errorf("outbox.ClaimBatch: rows: %w", err)
 	}
 	return msgs, nil
 }
@@ -84,9 +91,12 @@ func (s *PostgresOutboxStore) MarkProcessed(ctx context.Context, id uuid.UUID) e
 }
 
 func (s *PostgresOutboxStore) MarkFailed(ctx context.Context, id uuid.UUID, reason string) error {
+	// Clearing locked_at is what makes the retry happen: without it the message
+	// stays claimed for the full reclaim window instead of being picked up on
+	// the next tick.
 	_, err := s.pool.Exec(ctx, `
 		UPDATE outbox_messages
-		SET attempts = attempts + 1, last_error = $1
+		SET attempts = attempts + 1, last_error = $1, locked_at = NULL
 		WHERE id = $2
 	`, reason, id)
 	if err != nil {
