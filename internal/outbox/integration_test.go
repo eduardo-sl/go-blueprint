@@ -214,3 +214,96 @@ func TestPostgresOutboxStore_MarkProcessedRemovesFromClaims(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, after, "a processed message must never be claimed again")
 }
+
+// TestPostgresOutboxStore_ExhaustedMessageNotClaimed is the R1 predicate: a
+// message that has used every attempt must leave the claim query even if it was
+// never marked processed.
+func TestPostgresOutboxStore_ExhaustedMessageNotClaimed(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	store := outbox.NewPostgresStore(pool)
+
+	ids := seedMessages(t, pool, store, 1)
+
+	_, err := pool.Exec(ctx,
+		`UPDATE outbox_messages SET attempts = $1 WHERE id = $2`, _maxAttempts, ids[0])
+	require.NoError(t, err)
+
+	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
+	require.NoError(t, err)
+	assert.Empty(t, claimed, "a message at the attempt ceiling must not be claimed again")
+
+	// One attempt below the ceiling it is still deliverable — the predicate is a
+	// ceiling, not a blanket ban on retried messages.
+	_, err = pool.Exec(ctx,
+		`UPDATE outbox_messages SET attempts = $1 WHERE id = $2`, _maxAttempts-1, ids[0])
+	require.NoError(t, err)
+
+	claimed, err = store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	assert.Equal(t, ids[0], claimed[0].ID)
+}
+
+// TestPostgresOutboxStore_BackoffDelaysClaim is the R2 predicate: MarkFailed
+// schedules the next attempt, and the claim query honours that schedule.
+func TestPostgresOutboxStore_BackoffDelaysClaim(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	store := outbox.NewPostgresStore(pool)
+
+	ids := seedMessages(t, pool, store, 1)
+
+	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+
+	require.NoError(t, store.MarkFailed(ctx, ids[0], "downstream unavailable", time.Minute))
+
+	// The claim is released, but the schedule holds the message back.
+	early, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
+	require.NoError(t, err)
+	assert.Empty(t, early, "a message must not be retried before next_attempt_at")
+
+	_, err = pool.Exec(ctx,
+		`UPDATE outbox_messages SET next_attempt_at = now() - interval '1 second' WHERE id = $1`,
+		ids[0])
+	require.NoError(t, err)
+
+	due, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
+	require.NoError(t, err)
+	require.Len(t, due, 1, "a message must be claimable once its schedule has passed")
+	assert.Equal(t, ids[0], due[0].ID)
+}
+
+// TestPostgresOutboxStore_MarkExhaustedIsTerminal covers the audit trail: the
+// row leaves the claim query but keeps the evidence of why delivery stopped.
+func TestPostgresOutboxStore_MarkExhaustedIsTerminal(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	store := outbox.NewPostgresStore(pool)
+
+	ids := seedMessages(t, pool, store, 1)
+
+	claimed, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+
+	require.NoError(t, store.MarkExhausted(ctx, ids[0], "topic does not exist"))
+
+	after, err := store.ClaimBatch(ctx, 1, _reclaimWindow, _maxAttempts)
+	require.NoError(t, err)
+	assert.Empty(t, after, "an exhausted message must never be claimed again")
+
+	var attempts int
+	var lastError *string
+	var processedAt *time.Time
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT attempts, last_error, processed_at FROM outbox_messages WHERE id = $1`, ids[0],
+	).Scan(&attempts, &lastError, &processedAt))
+
+	assert.Equal(t, 1, attempts)
+	require.NotNil(t, lastError)
+	assert.Equal(t, "topic does not exist", *lastError)
+	require.NotNil(t, processedAt, "processed_at is what removes the row from the claim query")
+}
