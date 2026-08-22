@@ -21,8 +21,9 @@ type Config struct {
 	RedisPassword string        `mapstructure:"redis_password"`
 	RedisDB       int           `mapstructure:"redis_db"`
 	CacheTTL      time.Duration `mapstructure:"cache_ttl"`
-	WorkerCount    int `mapstructure:"worker_count"`
-	WorkerQueue    int `mapstructure:"worker_queue"`
+	WorkerCount        int           `mapstructure:"worker_count"`
+	WorkerQueue        int           `mapstructure:"worker_queue"`
+	WorkerDrainTimeout time.Duration `mapstructure:"worker_drain_timeout"`
 	OutboxInterval int `mapstructure:"outbox_interval"` // seconds
 	OutboxBatch    int `mapstructure:"outbox_batch"`
 	OTelEnabled     bool   `mapstructure:"otel_enabled"`
@@ -64,6 +65,7 @@ func Load() (*Config, error) {
 	v.SetDefault("cache_ttl", "5m")
 	v.SetDefault("worker_count", 4)
 	v.SetDefault("worker_queue", 100)
+	v.SetDefault("worker_drain_timeout", "15s")
 	v.SetDefault("outbox_interval", 5)
 	v.SetDefault("outbox_batch", 50)
 	v.SetDefault("otel_enabled", false)
@@ -100,6 +102,9 @@ func Load() (*Config, error) {
 	}
 	if err := v.BindEnv("cache_ttl", "CACHE_TTL"); err != nil {
 		return nil, fmt.Errorf("config: bind CACHE_TTL: %w", err)
+	}
+	if err := v.BindEnv("worker_drain_timeout", "WORKER_DRAIN_TIMEOUT"); err != nil {
+		return nil, fmt.Errorf("config: bind WORKER_DRAIN_TIMEOUT: %w", err)
 	}
 	if err := v.BindEnv("otel_enabled", "OTEL_ENABLED"); err != nil {
 		return nil, fmt.Errorf("config: bind OTEL_ENABLED: %w", err)
