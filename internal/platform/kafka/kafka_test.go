@@ -13,8 +13,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/eduardo-sl/go-blueprint/internal/outbox"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/kafka"
@@ -382,4 +384,125 @@ func TestChain_MiddlewareOrder(t *testing.T) {
 	require.NoError(t, handler.Handle(context.Background(), &kgo.Record{}))
 
 	assert.Equal(t, []string{"A:before", "B:before", "handler", "B:after", "A:after"}, order)
+}
+
+// failEveryProduce makes every produce request to fk fail with a non-retriable
+// error and counts the requests it saw. The error code is what makes the count
+// meaningful: franz-go does not retry a non-retriable code, so the counter ends
+// up holding exactly the number of times Publish asked a broker to store the
+// record.
+func failEveryProduce(t *testing.T, fk *kfake.Cluster, count *atomic.Int32) {
+	t.Helper()
+
+	fk.ControlKey(kmsg.Produce.Int16(), func(req kmsg.Request) (kmsg.Response, error, bool) {
+		pr, ok := req.(*kmsg.ProduceRequest)
+		if !ok {
+			return nil, nil, false
+		}
+
+		resp := pr.ResponseKind().(*kmsg.ProduceResponse)
+		for _, reqTopic := range pr.Topics {
+			respTopic := kmsg.NewProduceResponseTopic()
+			// Both identifiers are echoed back: produce v13 addresses topics by
+			// ID, earlier versions by name.
+			respTopic.Topic = reqTopic.Topic
+			respTopic.TopicID = reqTopic.TopicID
+			for _, part := range reqTopic.Partitions {
+				respPart := kmsg.NewProduceResponseTopicPartition()
+				respPart.Partition = part.Partition
+				respPart.ErrorCode = kerr.RecordListTooLarge.Code
+				respTopic.Partitions = append(respTopic.Partitions, respPart)
+			}
+			resp.Topics = append(resp.Topics, respTopic)
+		}
+
+		count.Add(1)
+		fk.KeepControl()
+		return resp, nil, true
+	})
+}
+
+// TestProducer_SingleAttemptThenDLQ pins the retry topology: Publish asks the
+// broker exactly once and hands the failure to the DLQ. The application retry
+// loop this replaces would have made retries+1 attempts per Publish, on top of
+// whatever the client did on its own.
+//
+// The DLQ lives on a second cluster so the failure injection above can fail
+// every produce it sees without also breaking the DLQ write.
+func TestProducer_SingleAttemptThenDLQ(t *testing.T) {
+	const retries = 3
+	topic := "test.events.single"
+	dlqTopic := "test.events.single.dlq"
+	fk, addrs := newFakeCluster(t, topic)
+	_, dlqAddrs := newFakeCluster(t, dlqTopic)
+	logger := newTestLogger()
+
+	var produceRequests atomic.Int32
+	failEveryProduce(t, fk, &produceRequests)
+
+	dlqWriter, err := kafka.NewDLQWriter(dlqAddrs, dlqTopic, logger)
+	require.NoError(t, err)
+	defer dlqWriter.Close()
+
+	producer, err := kafka.NewProducer(addrs, topic, dlqWriter, retries, logger)
+	require.NoError(t, err)
+	defer producer.Close()
+
+	msg := newOutboxMsg("CustomerRegistered")
+	// The DLQ write succeeds, so Publish reports success to the poller: the
+	// message is accounted for, just not on the happy path.
+	require.NoError(t, producer.Publish(context.Background(), msg))
+
+	assert.Equal(t, int32(1), produceRequests.Load(),
+		"Publish must make exactly one produce attempt and leave retries to the client")
+
+	// The record must actually be in the DLQ, not merely counted as failed.
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(dlqAddrs...),
+		kgo.ConsumeTopics(dlqTopic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	require.NoError(t, err)
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	fetches := cl.PollFetches(ctx)
+	require.NoError(t, fetches.Err())
+
+	records := fetches.Records()
+	require.Len(t, records, 1)
+	assert.Equal(t, msg.AggregateID.String(), string(records[0].Key))
+}
+
+// TestProducer_CancelledContext covers the other half of removing the loop: a
+// cancelled context ends the publish instead of feeding a retry that cannot
+// succeed.
+func TestProducer_CancelledContext(t *testing.T) {
+	topic := "test.events.cancelled"
+	dlqTopic := "test.events.cancelled.dlq"
+	_, addrs := newFakeCluster(t, topic, dlqTopic)
+	logger := newTestLogger()
+
+	dlqWriter, err := kafka.NewDLQWriter(addrs, dlqTopic, logger)
+	require.NoError(t, err)
+	defer dlqWriter.Close()
+
+	producer, err := kafka.NewProducer(addrs, topic, dlqWriter, 3, logger)
+	require.NoError(t, err)
+	defer producer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- producer.Publish(ctx, newOutboxMsg("CustomerRegistered")) }()
+
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Publish did not return on a cancelled context")
+	}
 }

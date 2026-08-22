@@ -43,11 +43,11 @@ flow is unchanged — only the delivery mechanism changes:
 ┌──────────────────────────────────────────────────────────────────────┐
 │  OUTBOX POLLER                                                       │
 │                                                                      │
-│   SELECT ... FOR UPDATE SKIP LOCKED                                  │
+│   ClaimBatch (UPDATE ... FOR UPDATE SKIP LOCKED)                     │
 │   KafkaProducer.Publish(msg)  ← was LogPublisher                    │
-│     ├─ retry up to N times with exponential backoff                  │
+│     ├─ one ProduceSync; the client owns the retries                  │
 │     ├─ success → UPDATE outbox SET processed_at = now()             │
-│     └─ max retries exceeded → DLQWriter.Write(msg, err)             │
+│     └─ failure → DLQWriter.Write(msg, err)                          │
 └──────────────────────────────────────────────────────────────────────┘
 
                             ↓ (Kafka broker)
@@ -108,28 +108,34 @@ event delivery correctness, durability wins.
 
 ## Part 1: The Producer
 
-### Retry with Exponential Backoff
+### One Attempt Per Publish
 
 ```go
 // internal/platform/kafka/producer.go
 
-for attempt := 0; attempt <= p.retries; attempt++ {
-    if err := p.client.ProduceSync(ctx, record).FirstErr(); err != nil {
-        lastErr = err
-        p.logger.WarnContext(ctx, "kafka produce failed, retrying",
-            "attempt", attempt, "error", err)
-        continue
-    }
-    return nil
+if err := p.client.ProduceSync(ctx, record).FirstErr(); err != nil {
+    p.logger.ErrorContext(ctx, "kafka produce failed, sending to DLQ",
+        "message_id", msg.ID, "error", err)
+    return p.dlq.Write(ctx, msg, err)
 }
-// max retries exceeded → DLQ
-return p.dlq.Write(ctx, msg, lastErr)
+return nil
 ```
 
-The retry loop is intentionally at the application level, separate from franz-go's
-internal retry. The application-level retry controls the DLQ handoff: after `p.retries`
-attempts, the message is forwarded to the dead letter topic instead of returning an error
-to the outbox poller. This prevents the poller from retrying indefinitely.
+`Publish` makes exactly one produce attempt. Retries belong to the franz-go client,
+configured in `NewProducer` as `kgo.RequestRetries(retries)` with an exponential
+`kgo.RetryBackoffFn` — that layer can see leader elections and metadata refreshes,
+which an application loop cannot.
+
+There used to be a second retry loop here, wrapped around a client that was already
+retrying. Nesting the two made the worst-case publish latency the *product* of both,
+and only the inner layer was documented. There are now three retry layers total, each
+at a different timescale and each with one job:
+
+| Layer | Bounded by | Handles |
+|---|---|---|
+| franz-go client | `KAFKA_PRODUCER_RETRIES` | Broker-level transients: leader election, metadata refresh |
+| DLQ handoff | one attempt | A send the client gave up on — the record is preserved, not lost |
+| Outbox poller | `OUTBOX_MAX_ATTEMPTS` | Everything else, with exponential backoff between ticks |
 
 ### Message Headers
 
@@ -147,7 +153,7 @@ These headers let consumers process records without parsing the payload for rout
 
 ## Part 2: The Dead Letter Queue (DLQ)
 
-When the producer exhausts its retries, the message is written to the DLQ topic
+When the client gives up on a send, the message is written to the DLQ topic
 (`customers.events.dlq`) instead of being lost. The DLQ record carries the original
 payload plus failure metadata:
 
@@ -155,7 +161,7 @@ payload plus failure metadata:
 |---|---|
 | `event_type` | Original event type |
 | `message_id` | Original message UUID |
-| `failure_reason` | Error string from the last produce attempt |
+| `failure_reason` | Error string from the produce attempt |
 | `failed_at` | RFC3339 timestamp of the failure |
 
 **DLQ write failure**: if the DLQ write itself fails, the error is logged as critical
@@ -292,7 +298,7 @@ are invisible to older consumers.
 | `KAFKA_TOPIC_CUSTOMERS` | `customers.events` | Topic for customer domain events |
 | `KAFKA_DLQ_TOPIC` | `customers.events.dlq` | Dead letter topic |
 | `KAFKA_CONSUMER_GROUP` | `go-blueprint` | Consumer group ID |
-| `KAFKA_PRODUCER_RETRIES` | `3` | Max produce attempts before DLQ |
+| `KAFKA_PRODUCER_RETRIES` | `3` | Client-level request retries (`kgo.RequestRetries`) |
 
 ---
 
@@ -366,7 +372,7 @@ event_type:CustomerRegistered,message_id:<uuid>,occurred_at:2026-04-28T...
 
 | Failure | Consequence | Recovery |
 |---|---|---|
-| Broker unreachable on produce | Producer retries with backoff | After N retries: DLQ write |
+| Broker unreachable on produce | Client retries with backoff, up to `KAFKA_PRODUCER_RETRIES` | Client gives up: DLQ write |
 | DLQ write fails | Error logged, outbox marks message failed | Next outbox poll retries |
 | Consumer handler returns error | Batch offset NOT committed | Same records redelivered on next poll |
 | Consumer handler panics | Recovery middleware converts to error | Same as handler error above |
@@ -389,6 +395,8 @@ go test ./internal/customer/... -run TestEventHandler -race -count=1
 Tests use `kfake` — an in-process Kafka fake from the franz-go project. No real Kafka
 cluster is needed. Tests cover:
 - Producer happy path (record arrives with correct key and headers)
+- Producer makes exactly one produce attempt, then hands the record to the DLQ
+- Producer returns on a cancelled context instead of spinning
 - DLQ write (record arrives with failure metadata headers)
 - Consumer happy path (handler called, offset committed)
 - Consumer handler error (offset NOT committed, redelivered on next consumer)
