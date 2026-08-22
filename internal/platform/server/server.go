@@ -35,7 +35,7 @@ type CachePinger interface {
 //
 // Graceful shutdown sequence (orchestrated by the caller, not by this function):
 //  1. OS signal received → caller cancels root ctx
-//  2. Start returns after Echo drains active requests (10s timeout)
+//  2. Start returns after srv drains active requests (10s timeout)
 //  3. Caller calls worker.Pool.Stop() — drains queued jobs, waits for in-flight
 //  4. Caller defers pool.Close() — Postgres connections released
 //  5. Process exits 0
@@ -96,7 +96,10 @@ func Start(
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), _shutdownTimeout)
 	defer cancel()
 
-	if err := e.Shutdown(shutdownCtx); err != nil {
+	// srv owns the listener; e.Server was never started, so shutting down via
+	// the Echo instance would drain an unbound server and return immediately.
+	// Shut down the object that is actually serving.
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("server: shutdown: %w", err)
 	}
 
