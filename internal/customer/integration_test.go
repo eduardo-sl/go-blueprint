@@ -30,10 +30,12 @@ import (
 // noopOutbox satisfies outbox.OutboxStore without side effects.
 type noopOutbox struct{}
 
-func (noopOutbox) SaveTx(_ context.Context, _ pgx.Tx, _ outbox.OutboxMessage) error         { return nil }
-func (noopOutbox) FetchUnprocessed(_ context.Context, _ int) ([]outbox.OutboxMessage, error) { return nil, nil }
-func (noopOutbox) MarkProcessed(_ context.Context, _ uuid.UUID) error                        { return nil }
-func (noopOutbox) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error                 { return nil }
+func (noopOutbox) SaveTx(_ context.Context, _ pgx.Tx, _ outbox.OutboxMessage) error { return nil }
+func (noopOutbox) ClaimBatch(_ context.Context, _ int, _ time.Duration) ([]outbox.OutboxMessage, error) {
+	return nil, nil
+}
+func (noopOutbox) MarkProcessed(_ context.Context, _ uuid.UUID) error        { return nil }
+func (noopOutbox) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error { return nil }
 
 // noopEventLog satisfies eventlog.Store without side effects.
 type noopEventLog struct{}
