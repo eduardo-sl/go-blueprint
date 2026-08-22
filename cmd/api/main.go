@@ -182,6 +182,7 @@ func main() {
 		workerPool,
 		time.Duration(cfg.OutboxInterval)*time.Second,
 		cfg.OutboxBatch,
+		cfg.OutboxMaxAttempts,
 		logger,
 	)
 	// Poller exits when ctx is cancelled (step 3 of graceful shutdown).

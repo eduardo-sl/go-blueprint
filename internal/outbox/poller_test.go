@@ -17,18 +17,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// _maxAttempts is the delivery ceiling these tests poll under.
+const _maxAttempts = 5
+
 func nopLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // ---- test doubles ----
 
 type stubStore struct {
-	mu            sync.Mutex
-	msgs          []outbox.OutboxMessage
-	claimed       map[uuid.UUID]bool
-	processedIDs  []uuid.UUID
-	processedSet  map[uuid.UUID]bool
-	failedIDs     []uuid.UUID
-	failedReasons []string
+	mu               sync.Mutex
+	msgs             []outbox.OutboxMessage
+	claimed          map[uuid.UUID]bool
+	processedIDs     []uuid.UUID
+	processedSet     map[uuid.UUID]bool
+	failedIDs        []uuid.UUID
+	failedReasons    []string
+	failedRetryAfter []time.Duration
+	exhaustedIDs     []uuid.UUID
+	exhaustedReasons []string
 }
 
 func newStubStore(msgs ...outbox.OutboxMessage) *stubStore {
@@ -48,12 +54,12 @@ func (s *stubStore) SaveTx(_ context.Context, _ pgx.Tx, msg outbox.OutboxMessage
 
 // ClaimBatch mirrors the real store: a message already claimed is not handed
 // out again until MarkFailed releases it.
-func (s *stubStore) ClaimBatch(_ context.Context, limit int, _ time.Duration) ([]outbox.OutboxMessage, error) {
+func (s *stubStore) ClaimBatch(_ context.Context, limit int, _ time.Duration, maxAttempts int) ([]outbox.OutboxMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var pending []outbox.OutboxMessage
 	for _, m := range s.msgs {
-		if !s.processedSet[m.ID] && !s.claimed[m.ID] {
+		if !s.processedSet[m.ID] && !s.claimed[m.ID] && m.Attempts < maxAttempts {
 			pending = append(pending, m)
 		}
 	}
@@ -74,13 +80,24 @@ func (s *stubStore) MarkProcessed(_ context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (s *stubStore) MarkFailed(_ context.Context, id uuid.UUID, reason string) error {
+func (s *stubStore) MarkFailed(_ context.Context, id uuid.UUID, reason string, retryAfter time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failedIDs = append(s.failedIDs, id)
 	s.failedReasons = append(s.failedReasons, reason)
+	s.failedRetryAfter = append(s.failedRetryAfter, retryAfter)
 	// The real store clears locked_at here so the next tick retries. This stub
 	// marks the message processed instead, to keep the failure count at one.
+	s.processedSet[id] = true
+	return nil
+}
+
+// MarkExhausted mirrors the real store: the row leaves the claim query for good.
+func (s *stubStore) MarkExhausted(_ context.Context, id uuid.UUID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.exhaustedIDs = append(s.exhaustedIDs, id)
+	s.exhaustedReasons = append(s.exhaustedReasons, reason)
 	s.processedSet[id] = true
 	return nil
 }
@@ -102,7 +119,7 @@ func (p *stubPublisher) Publish(_ context.Context, msg outbox.OutboxMessage) err
 }
 
 func newPoller(store outbox.OutboxStore, pub outbox.Publisher, pool *worker.Pool) *outbox.Poller {
-	return outbox.NewPoller(store, pub, pool, 1*time.Millisecond, 50, nopLogger())
+	return outbox.NewPoller(store, pub, pool, 1*time.Millisecond, 50, _maxAttempts, nopLogger())
 }
 
 // ---- tests ----

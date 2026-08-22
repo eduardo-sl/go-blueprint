@@ -223,11 +223,14 @@ func (stubBeginner) Begin(context.Context) (pgx.Tx, error) { return nil, context
 type stubOutbox struct{}
 
 func (stubOutbox) SaveTx(context.Context, pgx.Tx, outbox.OutboxMessage) error { return nil }
-func (stubOutbox) ClaimBatch(context.Context, int, time.Duration) ([]outbox.OutboxMessage, error) {
+func (stubOutbox) ClaimBatch(context.Context, int, time.Duration, int) ([]outbox.OutboxMessage, error) {
 	return nil, nil
 }
-func (stubOutbox) MarkProcessed(context.Context, uuid.UUID) error      { return nil }
-func (stubOutbox) MarkFailed(context.Context, uuid.UUID, string) error { return nil }
+func (stubOutbox) MarkProcessed(context.Context, uuid.UUID) error { return nil }
+func (stubOutbox) MarkFailed(context.Context, uuid.UUID, string, time.Duration) error {
+	return nil
+}
+func (stubOutbox) MarkExhausted(context.Context, uuid.UUID, string) error { return nil }
 
 type stubEventLog struct{}
 

@@ -266,11 +266,14 @@ type noopOutboxStore struct{}
 func (n *noopOutboxStore) SaveTx(_ context.Context, _ pgx.Tx, _ outbox.OutboxMessage) error {
 	return nil
 }
-func (n *noopOutboxStore) ClaimBatch(_ context.Context, _ int, _ time.Duration) ([]outbox.OutboxMessage, error) {
+func (n *noopOutboxStore) ClaimBatch(_ context.Context, _ int, _ time.Duration, _ int) ([]outbox.OutboxMessage, error) {
 	return nil, nil
 }
-func (n *noopOutboxStore) MarkProcessed(_ context.Context, _ uuid.UUID) error        { return nil }
-func (n *noopOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error { return nil }
+func (n *noopOutboxStore) MarkProcessed(_ context.Context, _ uuid.UUID) error { return nil }
+func (n *noopOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string, _ time.Duration) error {
+	return nil
+}
+func (n *noopOutboxStore) MarkExhausted(_ context.Context, _ uuid.UUID, _ string) error { return nil }
 
 // stubTx is a no-op pgx.Tx for unit tests that do not touch a real database.
 // Methods not implemented here panic — if a test triggers them, add the stub.
