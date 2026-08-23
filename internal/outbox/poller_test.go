@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/eduardo-sl/go-blueprint/internal/outbox"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetrytest"
 	"github.com/eduardo-sl/go-blueprint/internal/worker"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -405,4 +406,71 @@ func TestPoller_ExhaustedMessageNotReclaimed(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	assert.Len(t, store.exhaustedIDs, 1, "the message was delivered to the terminal path more than once")
+}
+
+// TestPoller_Metrics pins the publish-outcome counters to the branches that
+// drive them. Both instruments were registered and exported long before
+// anything incremented them, so a test that the instrument exists proves
+// nothing — this asserts the recorded value at each outcome.
+//
+// Not parallel: CollectCounters swaps the global meter provider.
+func TestPoller_Metrics(t *testing.T) {
+	tests := []struct {
+		name          string
+		publishErr    error
+		attempts      int
+		maxAttempts   int
+		wantPublished int64
+		wantFailures  int64
+	}{
+		{
+			name:          "success counts a publish",
+			attempts:      0,
+			maxAttempts:   _maxAttempts,
+			wantPublished: 1,
+			wantFailures:  0,
+		},
+		{
+			name:          "failure counts a failure",
+			publishErr:    errors.New("downstream unavailable"),
+			attempts:      0,
+			maxAttempts:   _maxAttempts,
+			wantPublished: 0,
+			wantFailures:  1,
+		},
+		{
+			// The exhaustion branch must count too: it is still a failed
+			// delivery, and it is the one that drops the event for good.
+			name:          "exhaustion counts a failure",
+			publishErr:    errors.New("downstream unavailable"),
+			attempts:      _maxAttempts - 1,
+			maxAttempts:   _maxAttempts,
+			wantPublished: 0,
+			wantFailures:  1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			msg := failingMsg(tt.attempts)
+			store := newStubStore(msg)
+			pub := &stubPublisher{err: tt.publishErr}
+			pool := worker.New(ctx, 2, 10, nopLogger())
+
+			poller := outbox.NewPoller(store, pub, pool, _pollInterval, 50, tt.maxAttempts, nopLogger())
+			pollCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer cancel()
+
+			counters := telemetrytest.CollectCounters(t, func() {
+				runPoller(pollCtx, poller, pool)
+			})
+
+			assert.Equal(t, tt.wantPublished, counters.Counter("outbox.messages.published.total"),
+				"outbox.messages.published.total")
+			assert.Equal(t, tt.wantFailures, counters.Counter("outbox.publish.failures.total"),
+				"outbox.publish.failures.total")
+		})
+	}
 }

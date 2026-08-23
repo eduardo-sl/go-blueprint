@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -89,11 +90,19 @@ func (c *CachedQueryService) GetByID(ctx context.Context, id uuid.UUID) (Custome
 	if data, err := c.cache.Get(ctx, key); err == nil {
 		var customer Customer
 		if jsonErr := json.Unmarshal(data, &customer); jsonErr == nil {
+			telemetry.CacheHits.Add(ctx, 1)
 			return customer, nil
 		}
-		// Corrupted entry — evict and fall through to DB.
+		// Corrupted entry — evict and fall through to DB. It counts as a miss:
+		// the read went to the database either way.
+		telemetry.CacheMisses.Add(ctx, 1)
 		_ = c.cache.Delete(ctx, key)
-	} else if !errors.Is(err, cache.ErrCacheMiss) {
+	} else if errors.Is(err, cache.ErrCacheMiss) {
+		telemetry.CacheMisses.Add(ctx, 1)
+	} else {
+		// A transport failure is neither a hit nor a miss — counting it as a
+		// miss would make the hit ratio read as a cold cache during an outage,
+		// hiding the outage behind a number that looks merely disappointing.
 		c.logger.WarnContext(ctx, "cache.Get failed, degrading to DB",
 			slog.String("key", key), slog.Any("error", err))
 	}
@@ -117,10 +126,14 @@ func (c *CachedQueryService) List(ctx context.Context) ([]Customer, error) {
 	if data, err := c.cache.Get(ctx, cacheKeyList); err == nil {
 		var customers []Customer
 		if jsonErr := json.Unmarshal(data, &customers); jsonErr == nil {
+			telemetry.CacheHits.Add(ctx, 1)
 			return customers, nil
 		}
+		telemetry.CacheMisses.Add(ctx, 1)
 		_ = c.cache.Delete(ctx, cacheKeyList)
-	} else if !errors.Is(err, cache.ErrCacheMiss) {
+	} else if errors.Is(err, cache.ErrCacheMiss) {
+		telemetry.CacheMisses.Add(ctx, 1)
+	} else {
 		c.logger.WarnContext(ctx, "cache.Get failed, degrading to DB",
 			slog.String("key", cacheKeyList), slog.Any("error", err))
 	}

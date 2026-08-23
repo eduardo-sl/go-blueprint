@@ -55,7 +55,7 @@ npx skills add eduardo-sl/go-agent-skills
 | Swagger/OpenAPI docs | ✅ Implemented | `docs/` (generated), annotations in handlers |
 | gRPC transport | ✅ Implemented | `internal/customer/grpc.go`, `internal/platform/grpc/`, `proto/`, `gen/` |
 | Kafka producer/consumer | ✅ Implemented | `internal/platform/kafka/`, `internal/customer/events.go` |
-| OpenTelemetry (traces + metrics) | 🔲 Spec ready, not implemented | `extensions/observability/SPEC.md` |
+| OpenTelemetry (traces + metrics) | ✅ Implemented | `internal/platform/telemetry/` |
 | MongoDB / Product Catalog context | ✅ Implemented | `internal/product/`, `internal/customer/preferences*.go`, `internal/platform/database/mongodb/` |
 
 ---
@@ -217,14 +217,16 @@ internal/platform/kafka/consumer.go                — Consumer: ConsumerGroup +
                                                      Run: AllowRebalance() ALWAYS first after PollFetches (avoids deadlock);
                                                      batchFailed flag — offset NOT committed if any record fails
 internal/platform/kafka/dlq.go                     — DLQWriter: writes to dead letter topic with failure_reason+failed_at headers
-internal/platform/kafka/middleware.go              — Chain(); WithLogging(); WithRecovery() (panic→error); WithIdempotency() (sync.Map)
+internal/platform/kafka/middleware.go              — Chain(); WithLogging(); WithRecovery() (panic→error); WithIdempotency()
+                                                     (bounded dedupSet, FIFO eviction at KAFKA_DEDUP_LIMIT); wired in cmd/api/main.go
 internal/platform/kafka/kafka_test.go              — kfake tests: produce, single produce attempt → DLQ, DLQ write, consumer dispatch,
                                                      error/no-commit, ctx cancel, idempotency, recovery, logging, chain order
 
 migrations/001_create_customers.sql                — customers table; pgcrypto extension
 migrations/002_create_users.sql                    — users table
-migrations/003_create_event_log.sql                — event_log table in Postgres (schema only; runtime uses SQLite)
+migrations/003_create_event_log.sql                — event_log table in Postgres (dropped again by 007; runtime uses SQLite)
 migrations/004_create_outbox.sql                   — outbox_messages + partial index WHERE processed_at IS NULL
+migrations/007_drop_pg_event_log.sql               — drops the orphaned Postgres event_log; SQLite event log unaffected
 
 queries/customers.sql                              — SQL consumed by sqlc for customer operations
 queries/users.sql                                  — SQL consumed by sqlc for user operations
@@ -379,8 +381,29 @@ cmd/api/main.go                         [wiring only, no business logic]
 | `GRPC_ADDR` | `GRPCAddr` | `":9090"` | grpc | No — gRPC listen address |
 | `MONGO_URI` | `MongoURI` | `"mongodb://localhost:27017"` | mongodb | No — MongoDB connection string |
 | `MONGO_DATABASE` | `MongoDatabase` | `"go_blueprint"` | mongodb | No — MongoDB database name |
+| `OTEL_ENABLED` | `OTelEnabled` | `false` | observability | No — `false` leaves the global meter/tracer noop |
+| `OTEL_SERVICE_NAME` | `OTelServiceName` | `"go-blueprint"` | observability | No |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `OTelEndpoint` | `"localhost:4318"` | observability | No — the one key whose env name viper cannot derive; see below |
+| `METRICS_ADDR` | `MetricsAddr` | `":9091"` | observability | No — Prometheus scrape listener |
+| `KAFKA_ENABLED` | `KafkaEnabled` | `false` | kafka | No — `false` skips producer, consumer and DLQ entirely |
+| `KAFKA_BROKERS` | `KafkaBrokers` | `"localhost:9092"` | kafka | No — comma-separated |
+| `KAFKA_TOPIC_CUSTOMERS` | `KafkaTopicCustomers` | `"customers.events"` | kafka | No |
+| `KAFKA_DLQ_TOPIC` | `KafkaDLQTopic` | `"customers.events.dlq"` | kafka | No |
+| `KAFKA_CONSUMER_GROUP` | `KafkaConsumerGroup` | `"go-blueprint"` | kafka | No |
+| `KAFKA_PRODUCER_RETRIES` | `KafkaProducerRetries` | `3` | kafka | No — client-level `kgo.RequestRetries`, not an application loop |
+| `KAFKA_DEDUP_LIMIT` | `KafkaDedupLimit` | `10000` | kafka | No — message IDs the consumer idempotency middleware retains before FIFO eviction |
 
-Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) plus `AutomaticEnv()`. `.env` loaded by godotenv (silently ignored if absent). Explicit `BindEnv` for required vars ensures env overrides YAML.
+Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) plus
+`AutomaticEnv()`. `.env` loaded by godotenv (silently ignored if absent).
+
+**`BindEnv` is called for exactly three keys, and the rule is worth knowing.**
+`SetDefault` registers a key in `AllKeys`, which is what makes `AutomaticEnv` resolve
+it during `Unmarshal` — so every defaulted key above is wired without an explicit
+binding. The three exceptions: `DATABASE_URL` and `JWT_SECRET` have no default and
+would otherwise be invisible to `Unmarshal`, and `OTEL_EXPORTER_OTLP_ENDPOINT` does
+not match the name the key replacer derives from `otel_endpoint`. Adding a `BindEnv`
+for anything else is redundant. `internal/platform/config/config_test.go` asserts
+every variable in this table resolves.
 
 ---
 
@@ -390,8 +413,7 @@ Config loaded by viper with YAML support (`config.yaml` at `.` or `./config/`) p
 |---|---|---|---|
 | `customers` | `id UUID PK`, `name TEXT`, `email TEXT UNIQUE`, `birth_date DATE`, `created_at TIMESTAMPTZ`, `updated_at TIMESTAMPTZ` | `001_create_customers.sql` | Customer domain |
 | `users` | `id UUID PK`, `email TEXT UNIQUE`, `password_hash TEXT`, `name TEXT`, `created_at TIMESTAMPTZ` | `002_create_users.sql` | Auth domain |
-| `event_log` (Postgres) | `id TEXT PK`, `aggregate_id TEXT`, `event_type TEXT`, `payload JSONB`, `occurred_at TIMESTAMPTZ`; index on `aggregate_id` | `003_create_event_log.sql` | Schema only — runtime uses SQLite |
-| `event_log` (SQLite) | same columns, `payload TEXT`, `occurred_at DATETIME`; auto-migrated by `eventlog.NewSQLiteStore`; stored at `cfg.EventLogPath` (`./data/events.db`) | inline in `eventlog/sqlite.go` | EventLog (actual runtime) |
+| `event_log` (SQLite) | `id TEXT PK`, `aggregate_id TEXT`, `event_type TEXT`, `payload TEXT`, `occurred_at DATETIME`; auto-migrated by `eventlog.NewSQLiteStore`; stored at `cfg.EventLogPath` (`./data/events.db`) | inline in `eventlog/sqlite.go` | EventLog — the only event log at runtime. Postgres never had one: `003` created a table nothing read, and `007` drops it. |
 | `outbox_messages` | `id UUID PK`, `aggregate_id UUID`, `event_type TEXT`, `payload JSONB`, `created_at TIMESTAMPTZ`, `processed_at TIMESTAMPTZ NULL`, `attempts INT DEFAULT 0`, `last_error TEXT NULL`, `locked_at TIMESTAMPTZ NULL`, `next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()`; partial index `idx_outbox_claimable` on `created_at WHERE processed_at IS NULL` | `004_create_outbox.sql`, `005_outbox_locking.sql`, `006_outbox_backoff.sql` | Outbox |
 
 ---
@@ -538,8 +560,8 @@ would expire before that job ever reaches a worker.
 |---|---|---|---|---|
 | gRPC | `extensions/grpc/SPEC.md` | ✅ Implemented | `google.golang.org/grpc`, `google.golang.org/protobuf` | Parallel gRPC transport alongside Echo; same Service/QueryService reused; recovery/logging/auth interceptors; server-side streaming |
 | MongoDB / Product Catalog | `extensions/mongodb/SPEC.md` | ✅ Implemented | `go.mongodb.org/mongo-driver/v2` | Second bounded context `internal/product/` with variable schema; polyglot persistence (Postgres + MongoDB); CustomerPreferences in MongoDB |
-| OpenTelemetry | `extensions/observability/SPEC.md` | 🔲 Spec ready | `go.opentelemetry.io/otel`, OTel exporters, `otelecho`, `otelpgx` | Distributed tracing + Prometheus metrics + slog-to-OTel bridge; OTLP exporter |
-| Kafka | `extensions/messaging/SPEC.md` | 🔲 Spec ready | `github.com/twmb/franz-go/pkg/kgo`, `kfake` | Replaces `LogPublisher` with production `KafkaPublisher`; consumer group with at-least-once, DLQ, idempotent consumer |
+| OpenTelemetry | `extensions/observability/SPEC.md` | ✅ Implemented | `go.opentelemetry.io/otel`, OTel exporters, `otelecho`, `otelpgx` | Distributed tracing + Prometheus metrics + slog-to-OTel bridge; OTLP exporter |
+| Kafka | `extensions/messaging/SPEC.md` | ✅ Implemented | `github.com/twmb/franz-go/pkg/kgo`, `kfake` | Replaces `LogPublisher` with production `KafkaPublisher`; consumer group with at-least-once, DLQ, idempotent consumer |
 
 ---
 

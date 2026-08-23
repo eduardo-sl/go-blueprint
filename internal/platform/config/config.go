@@ -41,6 +41,7 @@ type Config struct {
 	KafkaDLQTopic        string        `mapstructure:"kafka_dlq_topic"`
 	KafkaConsumerGroup   string        `mapstructure:"kafka_consumer_group"`
 	KafkaProducerRetries int           `mapstructure:"kafka_producer_retries"`
+	KafkaDedupLimit      int           `mapstructure:"kafka_dedup_limit"`
 }
 
 func Load() (*Config, error) {
@@ -84,71 +85,24 @@ func Load() (*Config, error) {
 	v.SetDefault("kafka_dlq_topic", "customers.events.dlq")
 	v.SetDefault("kafka_consumer_group", "go-blueprint")
 	v.SetDefault("kafka_producer_retries", 3)
+	v.SetDefault("kafka_dedup_limit", 10_000)
 
 	_ = v.ReadInConfig()
 
+	// AutomaticEnv resolves any key viper knows about, and SetDefault is what
+	// makes a key known — so the defaulted keys above need no explicit binding.
+	// Only three do: two have no default and would be invisible to Unmarshal,
+	// and one answers to an environment name the key replacer cannot derive.
 	if err := v.BindEnv("database_url", "DATABASE_URL"); err != nil {
 		return nil, fmt.Errorf("config: bind DATABASE_URL: %w", err)
 	}
 	if err := v.BindEnv("jwt_secret", "JWT_SECRET"); err != nil {
 		return nil, fmt.Errorf("config: bind JWT_SECRET: %w", err)
 	}
-	if err := v.BindEnv("redis_addr", "REDIS_ADDR"); err != nil {
-		return nil, fmt.Errorf("config: bind REDIS_ADDR: %w", err)
-	}
-	if err := v.BindEnv("redis_password", "REDIS_PASSWORD"); err != nil {
-		return nil, fmt.Errorf("config: bind REDIS_PASSWORD: %w", err)
-	}
-	if err := v.BindEnv("redis_db", "REDIS_DB"); err != nil {
-		return nil, fmt.Errorf("config: bind REDIS_DB: %w", err)
-	}
-	if err := v.BindEnv("cache_ttl", "CACHE_TTL"); err != nil {
-		return nil, fmt.Errorf("config: bind CACHE_TTL: %w", err)
-	}
-	if err := v.BindEnv("worker_drain_timeout", "WORKER_DRAIN_TIMEOUT"); err != nil {
-		return nil, fmt.Errorf("config: bind WORKER_DRAIN_TIMEOUT: %w", err)
-	}
-	if err := v.BindEnv("otel_enabled", "OTEL_ENABLED"); err != nil {
-		return nil, fmt.Errorf("config: bind OTEL_ENABLED: %w", err)
-	}
-	if err := v.BindEnv("otel_service_name", "OTEL_SERVICE_NAME"); err != nil {
-		return nil, fmt.Errorf("config: bind OTEL_SERVICE_NAME: %w", err)
-	}
+	// OTEL_EXPORTER_OTLP_ENDPOINT is the name the OTel spec gives this variable;
+	// the replacer would look for OTEL_ENDPOINT, so the binding stays.
 	if err := v.BindEnv("otel_endpoint", "OTEL_EXPORTER_OTLP_ENDPOINT"); err != nil {
 		return nil, fmt.Errorf("config: bind OTEL_EXPORTER_OTLP_ENDPOINT: %w", err)
-	}
-	if err := v.BindEnv("metrics_addr", "METRICS_ADDR"); err != nil {
-		return nil, fmt.Errorf("config: bind METRICS_ADDR: %w", err)
-	}
-	if err := v.BindEnv("grpc_enabled", "GRPC_ENABLED"); err != nil {
-		return nil, fmt.Errorf("config: bind GRPC_ENABLED: %w", err)
-	}
-	if err := v.BindEnv("grpc_addr", "GRPC_ADDR"); err != nil {
-		return nil, fmt.Errorf("config: bind GRPC_ADDR: %w", err)
-	}
-	if err := v.BindEnv("mongo_uri", "MONGO_URI"); err != nil {
-		return nil, fmt.Errorf("config: bind MONGO_URI: %w", err)
-	}
-	if err := v.BindEnv("mongo_database", "MONGO_DATABASE"); err != nil {
-		return nil, fmt.Errorf("config: bind MONGO_DATABASE: %w", err)
-	}
-	if err := v.BindEnv("kafka_enabled", "KAFKA_ENABLED"); err != nil {
-		return nil, fmt.Errorf("config: bind KAFKA_ENABLED: %w", err)
-	}
-	if err := v.BindEnv("kafka_brokers", "KAFKA_BROKERS"); err != nil {
-		return nil, fmt.Errorf("config: bind KAFKA_BROKERS: %w", err)
-	}
-	if err := v.BindEnv("kafka_topic_customers", "KAFKA_TOPIC_CUSTOMERS"); err != nil {
-		return nil, fmt.Errorf("config: bind KAFKA_TOPIC_CUSTOMERS: %w", err)
-	}
-	if err := v.BindEnv("kafka_dlq_topic", "KAFKA_DLQ_TOPIC"); err != nil {
-		return nil, fmt.Errorf("config: bind KAFKA_DLQ_TOPIC: %w", err)
-	}
-	if err := v.BindEnv("kafka_consumer_group", "KAFKA_CONSUMER_GROUP"); err != nil {
-		return nil, fmt.Errorf("config: bind KAFKA_CONSUMER_GROUP: %w", err)
-	}
-	if err := v.BindEnv("kafka_producer_retries", "KAFKA_PRODUCER_RETRIES"); err != nil {
-		return nil, fmt.Errorf("config: bind KAFKA_PRODUCER_RETRIES: %w", err)
 	}
 
 	var cfg Config

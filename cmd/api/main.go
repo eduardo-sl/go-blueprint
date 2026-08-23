@@ -158,7 +158,15 @@ func main() {
 		defer kafkaProducer.Close()
 		publisher = kafkaProducer
 
-		eventHandler := customer.NewEventHandler(logger)
+		// Chain applies first-is-outermost. Recovery wraps everything so a panic
+		// in logging or dedup is caught too; logging sits outside idempotency so
+		// a skipped duplicate is still recorded.
+		eventHandler := kafkaplatform.Chain(
+			customer.NewEventHandler(logger),
+			kafkaplatform.WithRecovery(logger),
+			kafkaplatform.WithLogging(logger),
+			kafkaplatform.WithIdempotency(logger, cfg.KafkaDedupLimit),
+		)
 		kafkaConsumer, err := kafkaplatform.NewConsumer(
 			brokers, cfg.KafkaConsumerGroup, cfg.KafkaTopicCustomers, eventHandler, logger,
 		)

@@ -236,10 +236,51 @@ The main Echo server (`ADDR`, default `:8080`) is not affected. Prometheus scrap
 | `customer.removals.total` | Counter | — | Successful customer removals |
 | `db.query.duration` | Histogram | — | SQL query duration (s) |
 | `db.query.errors.total` | Counter | — | SQL query errors |
-| `cache.hits.total` | Counter | — | Redis cache hits |
-| `cache.misses.total` | Counter | — | Redis cache misses |
+| `cache.hits.total` | Counter | — | Cache reads served from Redis |
+| `cache.misses.total` | Counter | — | Cache reads that fell through to the database |
 | `outbox.messages.published.total` | Counter | — | Outbox messages published |
-| `outbox.publish.failures.total` | Counter | — | Outbox publish failures |
+| `outbox.publish.failures.total` | Counter | — | Failed publish attempts, retried and exhausted alike |
+
+### Where the cache counters are recorded, and where they are not
+
+`CachedQueryService` has three branches on the read path and only two of them
+count:
+
+| Branch | Counter |
+|---|---|
+| Entry found and decoded | `cache.hits.total` |
+| `cache.ErrCacheMiss` | `cache.misses.total` |
+| Entry found but corrupt | `cache.misses.total` — the read went to the database either way |
+| `Get` returned a transport error | **neither** |
+
+The last row is the one worth arguing about. A Redis outage is not a cold cache.
+Counting it as a miss would drag the hit ratio down and make an incident read as
+disappointing cache performance; leaving it uncounted means the ratio stays
+honest about the requests Redis actually answered, and the outage shows up in
+the warn log and in Redis's own metrics where it belongs.
+
+Cache hit ratio is the headline number here — it is the measure of whether the
+Redis dependency earns its place.
+
+### Testing recorded values
+
+Asserting that an instrument is non-nil cannot fail: `init()` binds every one of
+them to a noop so callers never receive nil. Four of these counters stayed
+dormant for a long time behind exactly that assertion.
+
+`internal/platform/telemetrytest` installs a `sdkmetric.ManualReader`, rebinds
+the instruments to it, and returns the recorded sums by name:
+
+```go
+counters := telemetrytest.CollectCounters(t, func() {
+    _, err := svc.GetByID(ctx, id)
+    require.NoError(t, err)
+})
+assert.EqualValues(t, 1, counters.Counter("cache.hits.total"))
+```
+
+A test using it must not call `t.Parallel()` — the global `MeterProvider` is
+process-wide state. Cleanup restores the previous provider.
 
 ---
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetry"
 	"github.com/eduardo-sl/go-blueprint/internal/worker"
 )
 
@@ -82,7 +83,6 @@ func (p *Poller) poll(ctx context.Context) {
 	}
 
 	for _, msg := range msgs {
-		msg := msg // capture for goroutine — required pre-Go 1.22
 		err := p.pool.Submit(func(ctx context.Context) error {
 			return p.deliver(ctx, msg)
 		})
@@ -96,8 +96,12 @@ func (p *Poller) poll(ctx context.Context) {
 func (p *Poller) deliver(ctx context.Context, msg OutboxMessage) error {
 	err := p.publisher.Publish(ctx, msg)
 	if err == nil {
+		telemetry.OutboxMessagesPublished.Add(ctx, 1)
 		return p.store.MarkProcessed(ctx, msg.ID)
 	}
+	// Counted once per failed attempt, on both the retry and the exhaustion
+	// branch, so the rate reflects delivery pressure rather than message count.
+	telemetry.OutboxPublishFailures.Add(ctx, 1)
 
 	attempts := msg.Attempts + 1
 	if attempts >= p.maxAttempts {
