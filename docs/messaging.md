@@ -235,24 +235,45 @@ func (c *Consumer) Run(ctx context.Context) {
 
 ## Part 4: Consumer Middleware
 
-The middleware chain wraps a `Handler` with cross-cutting behavior. Applied in
-`cmd/api/main.go` via `kafka.Chain(handler, mw...)`:
+The middleware chain wraps a `Handler` with cross-cutting behavior. This is the
+wiring in `cmd/api/main.go`, inside the `if cfg.KafkaEnabled` block:
 
 ```go
-// Example: wrap the EventHandler with logging, recovery, and idempotency
-handler := kafka.Chain(
+eventHandler := kafka.Chain(
     customer.NewEventHandler(logger),
-    kafka.WithLogging(logger),
     kafka.WithRecovery(logger),
-    kafka.WithIdempotency(logger),
+    kafka.WithLogging(logger),
+    kafka.WithIdempotency(logger, cfg.KafkaDedupLimit),
 )
 ```
 
+`Chain` applies first-is-outermost, so the argument order is the nesting order.
+It is not arbitrary:
+
+- **`WithRecovery` outermost** — a panic in either of the other two is caught as
+  well. Recovery that sits inside another middleware protects less than it appears to.
+- **`WithLogging` outside `WithIdempotency`** — a duplicate that idempotency skips
+  is still recorded as a dispatch, so the log shows what arrived, not just what ran.
+
 | Middleware | Behavior |
 |---|---|
-| `WithLogging` | Logs each record before dispatch and on error |
-| `WithRecovery` | Catches panics from downstream handlers, returns them as errors |
-| `WithIdempotency` | Skips records whose `message_id` header was already processed |
+| `WithLogging` | Logs each record before dispatch and on error. One info line per record — demote to debug if the topic is driven hard |
+| `WithRecovery` | Catches panics from downstream handlers and returns them as errors. The offset is then withheld, so the record is redelivered |
+| `WithIdempotency` | Skips records whose `message_id` header was already seen |
+
+### The idempotency bound
+
+`WithIdempotency` holds message IDs in memory, capped at `KAFKA_DEDUP_LIMIT`
+(default 10,000) with oldest-first eviction. Two consequences to hold onto:
+
+- **It resets on restart.** Redelivery across a restart reaches the handler again.
+- **It forgets past the bound.** A message redelivered after 10,000 newer messages
+  have passed is treated as new.
+
+Neither is a bug; both are the price of not having a durable store. `customer.EventHandler`
+therefore carries no dedup of its own — that decision belongs to the middleware,
+in one place, where it composes. For durability across restarts, back the set with
+Redis rather than reintroducing per-handler state.
 
 `WithIdempotency` uses an in-memory `sync.Map`. **It resets on process restart.** For
 production dedup that survives restarts, replace the `sync.Map` with a Redis SET or a
