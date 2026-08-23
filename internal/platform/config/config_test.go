@@ -201,6 +201,11 @@ func TestLoad_ResolvesEveryEnvVar(t *testing.T) {
 			env:   map[string]string{"KAFKA_PRODUCER_RETRIES": "7"},
 			check: func(t *testing.T, c *config.Config) { assert.Equal(t, 7, c.KafkaProducerRetries) },
 		},
+		{
+			name:  "KAFKA_DEDUP_LIMIT",
+			env:   map[string]string{"KAFKA_DEDUP_LIMIT": "250"},
+			check: func(t *testing.T, c *config.Config) { assert.Equal(t, 250, c.KafkaDedupLimit) },
+		},
 	}
 
 	for _, tt := range tests {
@@ -238,6 +243,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.False(t, cfg.OTelEnabled)
 	assert.False(t, cfg.GRPCEnabled)
 	assert.False(t, cfg.KafkaEnabled)
+	assert.Equal(t, 10_000, cfg.KafkaDedupLimit)
 }
 
 // TestLoad_RequiredVars covers the two keys that have no default: they are the

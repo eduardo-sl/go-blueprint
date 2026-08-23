@@ -41,6 +41,7 @@ type Config struct {
 	KafkaDLQTopic        string        `mapstructure:"kafka_dlq_topic"`
 	KafkaConsumerGroup   string        `mapstructure:"kafka_consumer_group"`
 	KafkaProducerRetries int           `mapstructure:"kafka_producer_retries"`
+	KafkaDedupLimit      int           `mapstructure:"kafka_dedup_limit"`
 }
 
 func Load() (*Config, error) {
@@ -84,6 +85,7 @@ func Load() (*Config, error) {
 	v.SetDefault("kafka_dlq_topic", "customers.events.dlq")
 	v.SetDefault("kafka_consumer_group", "go-blueprint")
 	v.SetDefault("kafka_producer_retries", 3)
+	v.SetDefault("kafka_dedup_limit", 10_000)
 
 	_ = v.ReadInConfig()
 
