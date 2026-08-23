@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -297,7 +299,7 @@ func TestWithIdempotency_SkipsDuplicate(t *testing.T) {
 		return nil
 	})
 
-	handler := kafka.Chain(base, kafka.WithIdempotency(logger))
+	handler := kafka.Chain(base, kafka.WithIdempotency(logger, 100))
 
 	msgID := uuid.New().String()
 	record := &kgo.Record{
@@ -320,7 +322,7 @@ func TestWithIdempotency_NoMessageID(t *testing.T) {
 		return nil
 	})
 
-	handler := kafka.Chain(base, kafka.WithIdempotency(logger))
+	handler := kafka.Chain(base, kafka.WithIdempotency(logger, 100))
 
 	record := &kgo.Record{} // no headers
 
@@ -328,6 +330,99 @@ func TestWithIdempotency_NoMessageID(t *testing.T) {
 	require.NoError(t, handler.Handle(context.Background(), record))
 
 	assert.EqualValues(t, 2, callCount.Load(), "records without message_id must not be deduped")
+}
+
+// TestWithIdempotency_EvictsOldest pins the cost of the bound: the dedup set is
+// finite, so a message redelivered after `limit` newer messages have passed is
+// seen as new again. That is the trade an in-memory store makes, and it must be
+// visible in a test rather than discovered in production.
+func TestWithIdempotency_EvictsOldest(t *testing.T) {
+	logger := newTestLogger()
+
+	var callCount atomic.Int32
+	base := kafka.HandlerFunc(func(ctx context.Context, record *kgo.Record) error {
+		callCount.Add(1)
+		return nil
+	})
+
+	const limit = 3
+	handler := kafka.Chain(base, kafka.WithIdempotency(logger, limit))
+
+	recordFor := func(id string) *kgo.Record {
+		return &kgo.Record{Headers: []kgo.RecordHeader{{Key: "message_id", Value: []byte(id)}}}
+	}
+
+	// Fill past the bound: inserting "4" evicts "1".
+	for _, id := range []string{"1", "2", "3", "4"} {
+		require.NoError(t, handler.Handle(context.Background(), recordFor(id)))
+	}
+	assert.EqualValues(t, 4, callCount.Load(), "four distinct IDs must all be processed")
+
+	// "1" was evicted, so it is treated as new.
+	require.NoError(t, handler.Handle(context.Background(), recordFor("1")))
+	assert.EqualValues(t, 5, callCount.Load(), "an evicted message_id must be treated as new")
+
+	// "4" is still within the bound, so it is still recognised as a duplicate.
+	require.NoError(t, handler.Handle(context.Background(), recordFor("4")))
+	assert.EqualValues(t, 5, callCount.Load(), "a retained message_id must still be deduped")
+}
+
+// TestWithIdempotency_ConcurrentAdd guards the mutex that replaced the
+// concurrent map. Dispatch is single-goroutine today, but the middleware is a
+// composition point and nothing in its signature says otherwise.
+func TestWithIdempotency_ConcurrentAdd(t *testing.T) {
+	logger := newTestLogger()
+
+	var callCount atomic.Int32
+	base := kafka.HandlerFunc(func(ctx context.Context, record *kgo.Record) error {
+		callCount.Add(1)
+		return nil
+	})
+
+	handler := kafka.Chain(base, kafka.WithIdempotency(logger, 1_000))
+
+	const goroutines = 8
+	const perGoroutine = 50
+
+	var wg sync.WaitGroup
+	for g := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perGoroutine {
+				record := &kgo.Record{Headers: []kgo.RecordHeader{
+					{Key: "message_id", Value: fmt.Appendf(nil, "g%d-%d", g, i)},
+				}}
+				// Handle each ID twice: the second must always be skipped.
+				_ = handler.Handle(context.Background(), record)
+				_ = handler.Handle(context.Background(), record)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.EqualValues(t, goroutines*perGoroutine, callCount.Load(),
+		"each distinct message_id must reach the handler exactly once")
+}
+
+// TestWithIdempotency_NonPositiveLimit covers the misconfiguration path: a zero
+// or negative bound must fall back to the default, never to an unbounded set.
+func TestWithIdempotency_NonPositiveLimit(t *testing.T) {
+	logger := newTestLogger()
+
+	var callCount atomic.Int32
+	base := kafka.HandlerFunc(func(ctx context.Context, record *kgo.Record) error {
+		callCount.Add(1)
+		return nil
+	})
+
+	handler := kafka.Chain(base, kafka.WithIdempotency(logger, 0))
+
+	record := &kgo.Record{Headers: []kgo.RecordHeader{{Key: "message_id", Value: []byte("x")}}}
+	require.NoError(t, handler.Handle(context.Background(), record))
+	require.NoError(t, handler.Handle(context.Background(), record))
+
+	assert.EqualValues(t, 1, callCount.Load(), "a non-positive limit must still dedup")
 }
 
 // TestWithRecovery_CatchesPanic verifies panics are converted to errors without crashing.
