@@ -23,7 +23,7 @@ func TestPool_SubmitWithinCapacity(t *testing.T) {
 	p := worker.New(ctx, 2, 10, nopLogger())
 
 	var count atomic.Int64
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		err := p.Submit(func(ctx context.Context) error {
 			count.Add(1)
 			return nil
@@ -139,7 +139,7 @@ func TestPool_StopAfterCancel_NoDealock(t *testing.T) {
 
 	p := worker.New(ctx, 4, 20, nopLogger())
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_ = p.Submit(func(ctx context.Context) error {
 			time.Sleep(10 * time.Millisecond)
 			return nil

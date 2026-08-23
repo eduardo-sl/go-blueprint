@@ -82,7 +82,6 @@ func (p *Poller) poll(ctx context.Context) {
 	}
 
 	for _, msg := range msgs {
-		msg := msg // capture for goroutine — required pre-Go 1.22
 		err := p.pool.Submit(func(ctx context.Context) error {
 			return p.deliver(ctx, msg)
 		})
