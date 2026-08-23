@@ -11,6 +11,7 @@ import (
 
 	"github.com/eduardo-sl/go-blueprint/internal/customer"
 	"github.com/eduardo-sl/go-blueprint/internal/platform/cache"
+	"github.com/eduardo-sl/go-blueprint/internal/platform/telemetrytest"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
@@ -240,4 +241,106 @@ func TestCachedQueryService_List(t *testing.T) {
 		assert.Equal(t, 1, cr.getCalls)
 		assert.Contains(t, mc.deleted, "customer:list")
 	})
+}
+
+// TestCachedQueryService_Metrics covers the branch-to-counter mapping. The
+// instruments existed and were registered long before anything incremented
+// them, so the assertion that matters is on recorded values at each branch, not
+// on the instruments themselves.
+//
+// Not parallel: CollectCounters swaps the global meter provider.
+func TestCachedQueryService_Metrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		setupCache func(*mockCache, customer.Customer)
+		getErr     error
+		wantHits   int64
+		wantMisses int64
+		wantDBCall int
+	}{
+		{
+			name: "hit counts a hit",
+			setupCache: func(mc *mockCache, c customer.Customer) {
+				data, _ := json.Marshal(c)
+				mc.store["customer:"+c.ID.String()] = data
+			},
+			wantHits:   1,
+			wantMisses: 0,
+			wantDBCall: 0,
+		},
+		{
+			name:       "miss counts a miss",
+			wantHits:   0,
+			wantMisses: 1,
+			wantDBCall: 1,
+		},
+		{
+			name: "corrupt entry counts as a miss",
+			setupCache: func(mc *mockCache, c customer.Customer) {
+				mc.store["customer:"+c.ID.String()] = []byte("not-json{{{{")
+			},
+			wantHits:   0,
+			wantMisses: 1,
+			wantDBCall: 1,
+		},
+		{
+			// A transport failure is an outage, not a cold cache. Counting it
+			// as a miss would sink the hit ratio and disguise the outage as
+			// disappointing cache performance.
+			name:       "transport error counts neither",
+			getErr:     errors.New("connection refused"),
+			wantHits:   0,
+			wantMisses: 0,
+			wantDBCall: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newMockRepo()
+			c := seedCustomer(t, repo)
+
+			mc := newMockCache()
+			mc.getErr = tt.getErr
+			if tt.setupCache != nil {
+				tt.setupCache(mc, c)
+			}
+
+			cr := &countingRepo{inner: repo}
+			svc := newCachedQuery(cr, mc)
+
+			counters := telemetrytest.CollectCounters(t, func() {
+				got, err := svc.GetByID(context.Background(), c.ID)
+				require.NoError(t, err)
+				assert.Equal(t, c.ID, got.ID)
+			})
+
+			assert.Equal(t, tt.wantHits, counters.Counter("cache.hits.total"), "cache.hits.total")
+			assert.Equal(t, tt.wantMisses, counters.Counter("cache.misses.total"), "cache.misses.total")
+			assert.Equal(t, tt.wantDBCall, cr.getCalls, "database calls")
+		})
+	}
+}
+
+// TestCachedQueryService_List_Metrics pins the same mapping on the list path,
+// which caches under a different key and TTL and so instruments separately.
+func TestCachedQueryService_List_Metrics(t *testing.T) {
+	repo := newMockRepo()
+	seedCustomer(t, repo)
+
+	mc := newMockCache()
+	cr := &countingRepo{inner: repo}
+	svc := newCachedQuery(cr, mc)
+	ctx := context.Background()
+
+	counters := telemetrytest.CollectCounters(t, func() {
+		_, err := svc.List(ctx) // cold: a miss
+		require.NoError(t, err)
+		_, err = svc.List(ctx) // warm: a hit
+		require.NoError(t, err)
+	})
+
+	assert.EqualValues(t, 1, counters.Counter("cache.hits.total"))
+	assert.EqualValues(t, 1, counters.Counter("cache.misses.total"))
+	assert.Equal(t, 1, cr.getCalls, "the second call must be served from cache")
 }
