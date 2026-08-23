@@ -3,17 +3,20 @@ package customer
 import (
 	"context"
 	"log/slog"
-	"sync"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// EventHandler consumes customer domain events from Kafka.
-// It is idempotent: processing the same message twice is safe via in-memory dedup.
-// For persistence across restarts, replace sync.Map with a Redis or DB-backed store.
+// EventHandler consumes customer domain events from Kafka. It dispatches on
+// the event_type header and nothing more: deduplication belongs to
+// kafka.WithIdempotency, which composes and is wired ahead of this handler in
+// cmd/api/main.go.
+//
+// Handlers must still be idempotent in the sense the Handler contract requires
+// — the middleware's store is in-memory and bounded, so redelivery past the
+// bound reaches this handler again.
 type EventHandler struct {
-	processedIDs sync.Map
-	logger       *slog.Logger
+	logger *slog.Logger
 }
 
 // NewEventHandler creates an EventHandler.
@@ -29,16 +32,10 @@ func (h *EventHandler) Handle(ctx context.Context, record *kgo.Record) error {
 		return nil
 	}
 
-	if _, loaded := h.processedIDs.LoadOrStore(messageID, true); loaded {
-		h.logger.DebugContext(ctx, "kafka duplicate message, skipping",
-			"message_id", messageID,
-		)
-		return nil
-	}
-
 	eventType := kafkaHeaderValue(record, "event_type")
 	h.logger.InfoContext(ctx, "kafka customer event received",
 		"event_type", eventType,
+		"message_id", messageID,
 		"aggregate_id", string(record.Key),
 		"offset", record.Offset,
 	)
